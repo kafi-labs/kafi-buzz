@@ -1,0 +1,47 @@
+[package]
+name = "buzz-intel-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ACP adapter bridging Buzz to Intelligence Platform agents over HTTP/SSE"
+readme = "README.md"
+keywords = ["acp", "agent", "intel", "sse", "nostr"]
+categories = ["command-line-utilities", "web-programming"]
+
+[lib]
+name = "buzz_intel_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-intel-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "signal"] }
+reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+nostr = { workspace = true }
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+buzz-sdk = { workspace = true }
+# Explicit rustls ring provider — same multi-package build fix as buzz-cli.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+tempfile = "3"
+axum = { workspace = true }
