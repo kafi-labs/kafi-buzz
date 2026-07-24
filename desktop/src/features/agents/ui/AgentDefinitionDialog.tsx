@@ -44,6 +44,8 @@ import {
   getRuntimePersonaModelOptions,
   NO_RUNTIME_DROPDOWN_VALUE,
   runtimeSupportsLlmProviderSelection,
+  runtimeUsesFreeTextModel,
+  runtimeUsesFreeTextProvider,
   type PersonaDropdownOption,
   PERSONA_FIELD_CONTROL_CLASS,
   PERSONA_FIELD_SHELL_CLASS,
@@ -51,6 +53,11 @@ import {
   shouldClearKnownModelForSelectionScope,
   sortPersonaRuntimes,
 } from "./agentConfigOptions";
+import {
+  deriveAgentConfigFieldModel,
+  runtimeApiKeyEnvVar,
+  type AgentConfigFieldDescriptor,
+} from "../lib/agentConfigCore";
 import { RequiredFieldLabel } from "./agentConfigControls";
 import {
   modelDropdownOptions as buildModelDropdownOptions,
@@ -322,6 +329,7 @@ export function AgentDefinitionDialog({
       initialModel: initialValues.model,
       initialProvider: initialValues.provider,
       initialModelProviderEditableWithoutRuntime,
+      runtimeCatalog: selectedRuntime,
     });
     const namePool = parsePersonaNamePoolText(namePoolText);
     const namePoolInput =
@@ -365,12 +373,53 @@ export function AgentDefinitionDialog({
   const selectedRuntime = runtimes.find((p) => p.id === runtime);
   const blankRuntimeModelProviderEditable =
     initialModelProviderEditableWithoutRuntime && runtime.trim().length === 0;
+  // Catalog-driven capability: LLM dropdowns vs free-text gateway/agent fields.
   const runtimeCanChooseLlmProvider =
-    runtimeSupportsLlmProviderSelection(runtime) ||
+    runtimeSupportsLlmProviderSelection(selectedRuntime ?? runtime) ||
     blankRuntimeModelProviderEditable;
+  const freeTextProviderVisible =
+    runtime.trim().length > 0 && runtimeUsesFreeTextProvider(selectedRuntime);
+  const freeTextModelVisible =
+    runtime.trim().length > 0 && runtimeUsesFreeTextModel(selectedRuntime);
   const llmProviderFieldVisible =
     (runtime.trim().length > 0 && runtimeCanChooseLlmProvider) ||
     blankRuntimeModelProviderEditable;
+  // Free-text provider (gateway) or LLM provider both need the provider value.
+  const providerValueFieldVisible =
+    llmProviderFieldVisible || freeTextProviderVisible;
+  const runtimeApiKeyKey = runtimeApiKeyEnvVar(selectedRuntime);
+  const catalogFieldModel = React.useMemo(
+    () =>
+      deriveAgentConfigFieldModel({
+        config: {
+          env_vars: envVars,
+          model: model || null,
+          preferred_runtime: runtime || null,
+          provider: provider || null,
+        },
+        runtime: selectedRuntime,
+        scope: "definition",
+      }),
+    [envVars, model, provider, runtime, selectedRuntime],
+  );
+  const freeTextProviderField = catalogFieldModel.fields.find(
+    (
+      f,
+    ): f is Extract<AgentConfigFieldDescriptor, { kind: "provider" }> & {
+      mode: "freeText";
+    } => f.kind === "provider" && f.mode === "freeText",
+  );
+  const freeTextModelField = catalogFieldModel.fields.find(
+    (
+      f,
+    ): f is Extract<AgentConfigFieldDescriptor, { kind: "model" }> & {
+      mode: "freeText";
+    } => f.kind === "model" && f.mode === "freeText",
+  );
+  const apiKeyField = catalogFieldModel.fields.find(
+    (f): f is Extract<AgentConfigFieldDescriptor, { kind: "apiKey" }> =>
+      f.kind === "apiKey",
+  );
   const trimmedProvider = provider.trim();
   // Required credential env keys for this runtime + provider combination.
   // Used to show required markers on the LLM provider label and amber
@@ -411,6 +460,7 @@ export function AgentDefinitionDialog({
         model,
         provider: trimmedProvider,
         runtimeId: runtime,
+        runtime: selectedRuntime,
         runtimeFileConfig,
       }),
     [
@@ -422,6 +472,7 @@ export function AgentDefinitionDialog({
       model,
       trimmedProvider,
       runtime,
+      selectedRuntime,
       runtimeFileConfig,
     ],
   );
@@ -453,20 +504,28 @@ export function AgentDefinitionDialog({
     value: apiKeyValue,
   } = apiKeyFieldState;
   const providerIsRequired =
-    aiConfigurationMode === "custom" && runtimeCanChooseLlmProvider;
+    aiConfigurationMode === "custom" &&
+    (runtimeCanChooseLlmProvider ||
+      freeTextProviderField?.required === true ||
+      freeTextProviderVisible);
+  // LLM model dropdown vs free-text agent name for provider_locked runtimes.
   const modelFieldVisible =
-    runtime.trim().length > 0 || blankRuntimeModelProviderEditable;
+    (runtime.trim().length > 0 || blankRuntimeModelProviderEditable) &&
+    !freeTextModelVisible;
+  const freeTextModelFieldVisible =
+    freeTextModelVisible && aiConfigurationMode === "custom";
   const isExplicitModelRequired = aiConfigurationMode === "custom";
   // Gate the provider requirement on the field's actual visibility, not the raw
   // runtime capability. Codex/Claude hide the provider picker (they drive their
-  // own provider), so Customize must not require a provider there. But a
-  // runtime-less legacy/builtin definition still exposes the picker via
+  // own provider), so Customize must not require a provider there. Free-text
+  // gateway runtimes (provider_locked + provider_env_var) also require provider.
+  // A runtime-less legacy/builtin definition still exposes the picker via
   // blankRuntimeModelProviderEditable, so it must keep requiring a provider —
   // otherwise Save could persist `provider: undefined` despite the visible field.
   const customAiPairSatisfied = agentAiConfigurationModeSatisfied(
     aiConfigurationMode,
     { provider, model },
-    runtimeCanChooseLlmProvider,
+    providerValueFieldVisible,
   );
   const selectedRuntimeIsAvailable =
     runtime.trim().length === 0 ||
@@ -690,7 +749,9 @@ export function AgentDefinitionDialog({
         nextRuntime,
         nextRuntimeCanChooseProvider:
           nextRuntime.trim().length > 0 &&
-          runtimeSupportsLlmProviderSelection(nextRuntime),
+          runtimeSupportsLlmProviderSelection(
+            runtimes.find((p) => p.id === nextRuntime) ?? nextRuntime,
+          ),
         lockedRuntimeReset: "full",
       }),
     );
@@ -829,10 +890,15 @@ export function AgentDefinitionDialog({
               </div>
             </div>
 
-            {modelFieldVisible ? (
+            {modelFieldVisible ||
+            freeTextProviderVisible ||
+            freeTextModelVisible ||
+            runtimeApiKeyKey ? (
               <AgentAiConfigurationModeField
                 mode={aiConfigurationMode}
-                needsProviderSelection={runtimeCanChooseLlmProvider}
+                needsProviderSelection={
+                  runtimeCanChooseLlmProvider || freeTextProviderVisible
+                }
                 onModeChange={handleAiConfigurationModeChange}
               />
             ) : null}
@@ -898,6 +964,46 @@ export function AgentDefinitionDialog({
                 </div>
               ) : null}
 
+              {/* provider_locked free-text (e.g. INTEL_GATEWAY_URL) — catalog-driven */}
+              {freeTextProviderVisible &&
+              freeTextProviderField &&
+              aiConfigurationMode === "custom" ? (
+                <div className="space-y-1.5">
+                  <RequiredFieldLabel
+                    htmlFor="persona-runtime-provider-env"
+                    isRequired={freeTextProviderField.required}
+                  >
+                    {freeTextProviderField.label}
+                  </RequiredFieldLabel>
+                  <div
+                    className={cn(
+                      "flex min-h-11 items-center px-3",
+                      PERSONA_FIELD_SHELL_CLASS,
+                    )}
+                  >
+                    <Input
+                      autoCorrect="off"
+                      className={cn(
+                        "h-8 px-0 py-0 leading-6",
+                        PERSONA_FIELD_CONTROL_CLASS,
+                      )}
+                      data-testid="persona-runtime-gateway-url"
+                      disabled={isPending}
+                      id="persona-runtime-provider-env"
+                      onChange={(event) => setProvider(event.target.value)}
+                      placeholder={
+                        /URL|GATEWAY/i.test(
+                          freeTextProviderField.targetApplication.key,
+                        )
+                          ? "https://…"
+                          : freeTextProviderField.targetApplication.key
+                      }
+                      value={provider}
+                    />
+                  </div>
+                </div>
+              ) : null}
+
               {llmProviderFieldVisible &&
               aiConfigurationMode === "custom" &&
               topLevelSecretEnvVar ? (
@@ -919,6 +1025,63 @@ export function AgentDefinitionDialog({
                   }}
                   value={apiKeyValue}
                 />
+              ) : null}
+
+              {/* Runtime-owned API secret (e.g. INTEL_API_KEY) from catalog */}
+              {apiKeyField &&
+              runtimeApiKeyKey &&
+              aiConfigurationMode === "custom" ? (
+                <PersonaProviderApiKeyField
+                  disabled={isPending}
+                  isInherited={false}
+                  inheritedLabel=""
+                  isRequired={apiKeyField.required}
+                  label={apiKeyField.label}
+                  onValueChange={(next) => {
+                    setEnvVars((prev) => ({
+                      ...prev,
+                      [runtimeApiKeyKey]: next,
+                    }));
+                  }}
+                  value={envVars[runtimeApiKeyKey] ?? ""}
+                />
+              ) : null}
+
+              {freeTextModelFieldVisible && freeTextModelField ? (
+                <div className="space-y-1.5">
+                  <RequiredFieldLabel
+                    htmlFor="persona-runtime-model-env"
+                    isRequired={
+                      freeTextModelField.required || isExplicitModelRequired
+                    }
+                  >
+                    {freeTextModelField.label}
+                  </RequiredFieldLabel>
+                  <div
+                    className={cn(
+                      "flex min-h-11 items-center px-3",
+                      PERSONA_FIELD_SHELL_CLASS,
+                    )}
+                  >
+                    <Input
+                      autoCorrect="off"
+                      className={cn(
+                        "h-8 px-0 py-0 leading-6",
+                        PERSONA_FIELD_CONTROL_CLASS,
+                      )}
+                      data-testid="persona-runtime-agent-name"
+                      disabled={isPending}
+                      id="persona-runtime-model-env"
+                      onChange={(event) => setModel(event.target.value)}
+                      placeholder={
+                        freeTextModelField.targetApplication.kind === "envVar"
+                          ? freeTextModelField.targetApplication.key
+                          : "Agent name"
+                      }
+                      value={model}
+                    />
+                  </div>
+                </div>
               ) : null}
 
               <AnimatePresence initial={false}>

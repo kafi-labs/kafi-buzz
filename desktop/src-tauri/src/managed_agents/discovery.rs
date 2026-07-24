@@ -92,6 +92,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         context_limit_env_var: Some("GOOSE_CONTEXT_LIMIT"),
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
+        api_key_env_var: None,
         auth_probe_args: None,
     },
     KnownAcpRuntime {
@@ -123,6 +124,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         context_limit_env_var: None,
         required_normalized_fields: &[],
         login_hint: Some("Run the Claude CLI to complete authentication."),
+        api_key_env_var: None,
         auth_probe_args: Some(&["claude", "auth", "status"]),
     },
     KnownAcpRuntime {
@@ -155,6 +157,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         required_normalized_fields: &[],
         login_hint: Some("Run `codex login` to authenticate."),
         // Verified: `codex login status` exits 0 when logged in, non-zero otherwise.
+        api_key_env_var: None,
         auth_probe_args: Some(&["codex", "login", "status"]),
     },
     KnownAcpRuntime {
@@ -186,6 +189,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         context_limit_env_var: Some("BUZZ_AGENT_MAX_CONTEXT_TOKENS"),
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
+        api_key_env_var: None,
         auth_probe_args: None,
     },
     KnownAcpRuntime {
@@ -220,6 +224,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         // model → agent name; provider → gateway URL (see env vars above).
         required_normalized_fields: &["model", "provider"],
         login_hint: Some("Set INTEL_API_KEY (mint on your gateway)"),
+        api_key_env_var: Some("INTEL_API_KEY"),
         // args[0] is the executable (runtime_metadata.rs:60-62), not the flag.
         auth_probe_args: Some(&["buzz-intel-agent", "--auth-probe"]),
     },
@@ -1285,6 +1290,13 @@ pub fn discover_acp_runtimes() -> Vec<AcpRuntimeCatalogEntry> {
                     model_env_var: runtime.model_env_var.map(str::to_string),
                     provider_env_var: runtime.provider_env_var.map(str::to_string),
                     thinking_env_var: runtime.thinking_env_var.map(str::to_string),
+                    provider_locked: runtime.provider_locked,
+                    required_normalized_fields: runtime
+                        .required_normalized_fields
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
+                    api_key_env_var: runtime.api_key_env_var.map(str::to_string),
                     install_hint,
                     install_instructions_url: runtime.install_instructions_url.to_string(),
                     can_auto_install,

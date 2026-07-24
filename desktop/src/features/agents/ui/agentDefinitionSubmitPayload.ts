@@ -1,4 +1,8 @@
-import { runtimeSupportsLlmProviderSelection } from "./agentConfigOptions";
+import {
+  runtimeSupportsLlmProviderSelection,
+  runtimeUsesFreeTextProvider,
+  type RuntimeCapabilityCatalog,
+} from "./agentConfigOptions";
 
 /**
  * Pure helper extracted from the `handleSubmit` path of `AgentDefinitionDialog`
@@ -20,6 +24,7 @@ export function buildRuntimeModelProviderPayload({
   initialModel,
   initialProvider,
   initialModelProviderEditableWithoutRuntime,
+  runtimeCatalog,
 }: {
   runtime: string;
   model: string;
@@ -30,6 +35,8 @@ export function buildRuntimeModelProviderPayload({
   initialModel: string | null | undefined;
   initialProvider: string | null | undefined;
   initialModelProviderEditableWithoutRuntime: boolean;
+  /** Catalog entry for the selected runtime when loaded. */
+  runtimeCatalog?: RuntimeCapabilityCatalog | null;
 }): {
   runtime: string | undefined;
   model: string | undefined;
@@ -49,9 +56,13 @@ export function buildRuntimeModelProviderPayload({
     (initialModelProviderEditableWithoutRuntime ||
       isAutoSeededRuntimeForBuiltinEdit) &&
     runtimeForSubmit.length === 0;
-  const llmProviderVisibleForSubmit =
+  const capability = runtimeCatalog ?? runtimeForSubmit;
+  const providerValueVisibleForSubmit =
     (runtimeForSubmit.length > 0 &&
-      runtimeSupportsLlmProviderSelection(runtimeForSubmit)) ||
+      (runtimeSupportsLlmProviderSelection(capability) ||
+        runtimeUsesFreeTextProvider(
+          typeof capability === "object" ? capability : null,
+        ))) ||
     modelProviderEditableWithoutRuntime;
   const shouldPreserveHiddenModelProvider =
     isEditMode &&
@@ -66,7 +77,7 @@ export function buildRuntimeModelProviderPayload({
         : shouldPreserveHiddenModelProvider
           ? (initialModel ?? undefined)
           : undefined,
-    provider: llmProviderVisibleForSubmit
+    provider: providerValueVisibleForSubmit
       ? provider.trim() || undefined
       : shouldPreserveHiddenModelProvider
         ? (initialProvider ?? undefined)

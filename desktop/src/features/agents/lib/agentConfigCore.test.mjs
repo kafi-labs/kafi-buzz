@@ -23,6 +23,9 @@ function runtime(id, metadata = {}) {
     modelEnvVar: null,
     providerEnvVar: null,
     thinkingEnvVar: null,
+    providerLocked: false,
+    requiredNormalizedFields: [],
+    apiKeyEnvVar: null,
     installHint: "",
     installInstructionsUrl: "",
     canAutoInstall: false,
@@ -153,24 +156,24 @@ test("catalog mismatch cleanup is named and restricted to onboarding", () => {
   });
 });
 
-test("Intel runtime projects gateway + agent name via provider/model env vars", () => {
-  // Mirrors the desktop catalog projection for KNOWN_ACP_RUNTIMES id=intel
-  // (discovery.rs): model_env_var=INTEL_AGENT, provider_env_var=INTEL_GATEWAY_URL.
-  // agentConfigCore is the field-descriptor builder used by AgentConfigFields /
-  // defaults panels. Note: AgentDefinitionDialog still gates the LLM-provider
-  // picker with runtimeSupportsLlmProviderSelection (goose|buzz-agent only), so
-  // this projection alone does not make create-dialog gateway URL editable —
-  // see Iteration-4 wiring report.
+test("Intel runtime projects free-text gateway + agent name + API key (no LLM catalog)", () => {
+  // Catalog: model_env_var=INTEL_AGENT, provider_env_var=INTEL_GATEWAY_URL,
+  // provider_locked=true, required_normalized_fields=[model,provider],
+  // api_key_env_var=INTEL_API_KEY. LLM Anthropic/OpenAI dropdowns suppressed.
   const model = deriveAgentConfigFieldModel({
     config: {
       ...config,
       model: "buzz-e2e-assistant",
       provider: "https://intel-platform.exe.xyz",
+      env_vars: { INTEL_API_KEY: "intel_test" },
     },
     runtime: runtime("intel", {
       label: "Intelligence Platform",
       modelEnvVar: "INTEL_AGENT",
       providerEnvVar: "INTEL_GATEWAY_URL",
+      providerLocked: true,
+      requiredNormalizedFields: ["model", "provider"],
+      apiKeyEnvVar: "INTEL_API_KEY",
       thinkingEnvVar: null,
     }),
     scope: "definition",
@@ -178,8 +181,11 @@ test("Intel runtime projects gateway + agent name via provider/model env vars", 
 
   assert.deepEqual(
     model.fields.map((item) => item.kind),
-    ["provider", "model"],
+    ["provider", "model", "apiKey"],
   );
+  assert.equal(field(model, "provider").mode, "freeText");
+  assert.equal(field(model, "provider").label, "Gateway URL");
+  assert.equal(field(model, "provider").required, true);
   assert.deepEqual(field(model, "provider").targetApplication, {
     kind: "envVar",
     key: "INTEL_GATEWAY_URL",
@@ -188,12 +194,46 @@ test("Intel runtime projects gateway + agent name via provider/model env vars", 
     field(model, "provider").value,
     "https://intel-platform.exe.xyz",
   );
+  assert.equal(field(model, "model").mode, "freeText");
+  assert.equal(field(model, "model").label, "Agent name");
+  assert.equal(field(model, "model").required, true);
   assert.deepEqual(field(model, "model").targetApplication, {
     kind: "envVar",
     key: "INTEL_AGENT",
   });
   assert.equal(field(model, "model").value, "buzz-e2e-assistant");
+  assert.equal(field(model, "apiKey").label, "API key");
+  assert.deepEqual(field(model, "apiKey").targetApplication, {
+    kind: "envVar",
+    key: "INTEL_API_KEY",
+  });
+  assert.equal(field(model, "apiKey").value, "intel_test");
+  // No effort control for intel.
   assert.deepEqual(model.omissions, [
     { kind: "effort", reason: "unsupportedByHarness" },
   ]);
+});
+
+test("runtimeSupportsLlmProviderSelection uses catalog providerLocked (intel false)", async () => {
+  const { runtimeSupportsLlmProviderSelection } = await import(
+    "./agentConfigCore.ts"
+  );
+  assert.equal(
+    runtimeSupportsLlmProviderSelection(
+      runtime("intel", {
+        providerEnvVar: "INTEL_GATEWAY_URL",
+        providerLocked: true,
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    runtimeSupportsLlmProviderSelection(
+      runtime("goose", {
+        providerEnvVar: "GOOSE_PROVIDER",
+        providerLocked: false,
+      }),
+    ),
+    true,
+  );
 });

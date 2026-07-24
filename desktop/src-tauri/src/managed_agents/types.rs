@@ -581,6 +581,14 @@ pub struct AcpRuntimeCatalogEntry {
     pub provider_env_var: Option<String>,
     /// Environment variable used to apply thinking effort, when supported.
     pub thinking_env_var: Option<String>,
+    /// When true, the LLM-provider catalog is suppressed; `provider_env_var` (if
+    /// set) is a free-text deployment value (e.g. gateway URL), not Anthropic/OpenAI.
+    pub provider_locked: bool,
+    /// Normalized field keys required for this harness (`"model"`, `"provider"`, …).
+    pub required_normalized_fields: Vec<String>,
+    /// Runtime-owned API secret env var (not an LLM-provider key), e.g. `INTEL_API_KEY`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env_var: Option<String>,
     pub install_hint: String,
     pub install_instructions_url: String,
     /// true when at least one automated install step is available

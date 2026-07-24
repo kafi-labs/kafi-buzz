@@ -886,6 +886,7 @@ mod tests {
             context_limit_env_var: None,
             required_normalized_fields: &[],
             login_hint: None,
+            api_key_env_var: None,
             auth_probe_args: None,
         }
     }
@@ -1080,6 +1081,7 @@ mod tests {
             context_limit_env_var: None,
             required_normalized_fields: &[],
             login_hint: None,
+            api_key_env_var: None,
             auth_probe_args: None,
         }
     }

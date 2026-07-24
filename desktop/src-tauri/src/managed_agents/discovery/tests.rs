@@ -1097,6 +1097,11 @@ fn intel_runtime_is_discoverable_with_expected_metadata() {
         &["model", "provider"],
         "create/config bridge should treat agent name + gateway as required"
     );
+    assert_eq!(
+        intel.api_key_env_var,
+        Some("INTEL_API_KEY"),
+        "create dialog requires INTEL_API_KEY secret field"
+    );
     assert!(
         intel
             .login_hint

@@ -57,6 +57,10 @@ pub(crate) struct KnownAcpRuntime {
     /// Human-readable hint shown in Doctor when the runtime is available but not
     /// authenticated. `None` for runtimes that have no login step (goose, buzz-agent).
     pub login_hint: Option<&'static str>,
+    /// Env var for a runtime-owned API secret (not an LLM-provider key).
+    /// When set, create/edit dialogs show a required secret field (e.g. INTEL_API_KEY).
+    /// Distinct from provider catalog keys (ANTHROPIC_API_KEY / OPENAI_API_KEY).
+    pub api_key_env_var: Option<&'static str>,
     /// CLI args for probing authentication status. `args[0]` is the binary name;
     /// the remainder are the subcommand. `None` for runtimes with no login step.
     pub auth_probe_args: Option<&'static [&'static str]>,

@@ -146,12 +146,22 @@ test("runtimeSupportsLlmProviderSelection is false for codex and claude", () => 
   assert.equal(runtimeSupportsLlmProviderSelection("claude"), false);
 });
 
-test("runtimeSupportsLlmProviderSelection is false for intel (create-flow gap)", () => {
-  // Catalog registers provider_env_var=INTEL_GATEWAY_URL, but AgentDefinitionDialog
-  // only shows the LLM-provider picker for goose|buzz-agent. Intel therefore
-  // appears as a selectable harness without a first-class gateway URL control
-  // until create-flow wiring is extended (free-text gateway / custom provider).
+test("runtimeSupportsLlmProviderSelection is false for intel (provider_locked free-text)", () => {
+  // String bootstrap still excludes intel from LLM catalog. With a catalog
+  // entry, provider_locked + providerEnvVar also yields false — free-text
+  // gateway is used instead (see agentConfigCore freeText mode).
   assert.equal(runtimeSupportsLlmProviderSelection("intel"), false);
+  assert.equal(
+    runtimeSupportsLlmProviderSelection({
+      id: "intel",
+      providerEnvVar: "INTEL_GATEWAY_URL",
+      modelEnvVar: "INTEL_AGENT",
+      providerLocked: true,
+      requiredNormalizedFields: ["model", "provider"],
+      apiKeyEnvVar: "INTEL_API_KEY",
+    }),
+    false,
+  );
 });
 
 test("resetConfigForHarnessChange clears harness-specific values", () => {

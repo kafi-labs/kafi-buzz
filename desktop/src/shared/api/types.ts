@@ -545,6 +545,18 @@ export type AcpRuntimeCatalogEntry = {
   providerEnvVar: string | null;
   /** Environment variable used to apply thinking effort, when supported. */
   thinkingEnvVar: string | null;
+  /**
+   * When true, suppress the LLM-provider catalog. If `providerEnvVar` is set,
+   * treat it as free-text (e.g. gateway URL), not Anthropic/OpenAI selection.
+   */
+  providerLocked: boolean;
+  /** Normalized field keys required for this harness (`"model"`, `"provider"`, …). */
+  requiredNormalizedFields: string[];
+  /**
+   * Runtime-owned API secret env var (not an LLM-provider key), e.g. INTEL_API_KEY.
+   * When set, create/edit dialogs show a required secret field.
+   */
+  apiKeyEnvVar: string | null;
   installHint: string;
   installInstructionsUrl: string;
   canAutoInstall: boolean;

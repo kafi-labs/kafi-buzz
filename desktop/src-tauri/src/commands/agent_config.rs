@@ -631,6 +631,7 @@ mod tests {
             context_limit_env_var: Some("GOOSE_CONTEXT_LIMIT"),
             required_normalized_fields: &["model", "provider"],
             login_hint: None,
+            api_key_env_var: None,
             auth_probe_args: None,
         }
     }
