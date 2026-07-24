@@ -146,6 +146,14 @@ test("runtimeSupportsLlmProviderSelection is false for codex and claude", () => 
   assert.equal(runtimeSupportsLlmProviderSelection("claude"), false);
 });
 
+test("runtimeSupportsLlmProviderSelection is false for intel (create-flow gap)", () => {
+  // Catalog registers provider_env_var=INTEL_GATEWAY_URL, but AgentDefinitionDialog
+  // only shows the LLM-provider picker for goose|buzz-agent. Intel therefore
+  // appears as a selectable harness without a first-class gateway URL control
+  // until create-flow wiring is extended (free-text gateway / custom provider).
+  assert.equal(runtimeSupportsLlmProviderSelection("intel"), false);
+});
+
 test("resetConfigForHarnessChange clears harness-specific values", () => {
   const config = {
     env_vars: { BUZZ_AGENT_THINKING_EFFORT: "high", KEEP_ME: "yes" },

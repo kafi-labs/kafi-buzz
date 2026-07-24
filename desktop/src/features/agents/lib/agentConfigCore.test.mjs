@@ -152,3 +152,48 @@ test("catalog mismatch cleanup is named and restricted to onboarding", () => {
     onCatalogMismatch: "explainOnly",
   });
 });
+
+test("Intel runtime projects gateway + agent name via provider/model env vars", () => {
+  // Mirrors the desktop catalog projection for KNOWN_ACP_RUNTIMES id=intel
+  // (discovery.rs): model_env_var=INTEL_AGENT, provider_env_var=INTEL_GATEWAY_URL.
+  // agentConfigCore is the field-descriptor builder used by AgentConfigFields /
+  // defaults panels. Note: AgentDefinitionDialog still gates the LLM-provider
+  // picker with runtimeSupportsLlmProviderSelection (goose|buzz-agent only), so
+  // this projection alone does not make create-dialog gateway URL editable —
+  // see Iteration-4 wiring report.
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      model: "buzz-e2e-assistant",
+      provider: "https://intel-platform.exe.xyz",
+    },
+    runtime: runtime("intel", {
+      label: "Intelligence Platform",
+      modelEnvVar: "INTEL_AGENT",
+      providerEnvVar: "INTEL_GATEWAY_URL",
+      thinkingEnvVar: null,
+    }),
+    scope: "definition",
+  });
+
+  assert.deepEqual(
+    model.fields.map((item) => item.kind),
+    ["provider", "model"],
+  );
+  assert.deepEqual(field(model, "provider").targetApplication, {
+    kind: "envVar",
+    key: "INTEL_GATEWAY_URL",
+  });
+  assert.equal(
+    field(model, "provider").value,
+    "https://intel-platform.exe.xyz",
+  );
+  assert.deepEqual(field(model, "model").targetApplication, {
+    kind: "envVar",
+    key: "INTEL_AGENT",
+  });
+  assert.equal(field(model, "model").value, "buzz-e2e-assistant");
+  assert.deepEqual(model.omissions, [
+    { kind: "effort", reason: "unsupportedByHarness" },
+  ]);
+});
