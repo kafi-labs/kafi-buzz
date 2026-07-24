@@ -1,11 +1,12 @@
 //! ACP server loop: initialize / session/new / session/prompt / session/cancel.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use futures_util::FutureExt;
 use rand::RngExt;
 use serde_json::{json, Value};
 use tokio::io::BufReader;
@@ -17,12 +18,19 @@ use crate::error::AdapterError;
 use crate::intel::{FrameKind, IntelClient, SseFrame};
 use crate::prompt::parse_prompt;
 use crate::reply::RelayPublisher;
-use crate::state::{SessionEntry, StateStore};
+use crate::session_ensure::{get_or_create_intel_session, CreateLockMap};
+use crate::state::StateStore;
 use crate::wire::{
     self, classify, prompt_to_text, Inbound, InitializeParams, SessionCancelParams,
     SessionNewParams, SessionPromptParams, WireMsg, WireSender, INVALID_PARAMS, METHOD_NOT_FOUND,
     PARSE_ERROR,
 };
+
+/// Max wait when pushing a session/update under stdout backpressure.
+const SESSION_UPDATE_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Bound for the outbound wire channel (session/update + responses).
+const WIRE_CHANNEL_CAP: usize = 256;
 
 /// Local ACP session state.
 struct AcpSession {
@@ -40,10 +48,12 @@ struct App {
     state: Mutex<StateStore>,
     agent_id: Mutex<Option<String>>,
     sessions: Mutex<HashMap<String, AcpSession>>,
+    /// Single-flight locks for intel session creation per mapping key.
+    create_locks: CreateLockMap,
     relay: Option<RelayPublisher>,
 }
 
-/// Run the ACP NDJSON server until stdin EOF.
+/// Run the ACP NDJSON server until stdin EOF or SIGTERM.
 pub async fn run_server(cfg: Config) -> Result<(), AdapterError> {
     let intel = IntelClient::new(&cfg)?;
     let state = StateStore::load(&cfg.state_path)?;
@@ -71,25 +81,58 @@ pub async fn run_server(cfg: Config) -> Result<(), AdapterError> {
         state: Mutex::new(state),
         agent_id: Mutex::new(cached_agent),
         sessions: Mutex::new(HashMap::new()),
+        create_locks: Mutex::new(HashMap::new()),
         relay,
     });
 
-    let (wire_tx, wire_rx) = mpsc::channel::<WireMsg>(64);
+    let (wire_tx, wire_rx) = mpsc::channel::<WireMsg>(WIRE_CHANNEL_CAP);
     let writer = tokio::spawn(wire::writer_task(wire_rx));
 
     let max_line = cfg.max_line_bytes;
-    if let Err(e) = read_loop(
-        BufReader::new(tokio::io::stdin()),
-        app.clone(),
-        wire_tx,
-        max_line,
-    )
-    .await
+    let reader_app = app.clone();
+    let reader_tx = wire_tx.clone();
+    let read_fut = async {
+        if let Err(e) = read_loop(
+            BufReader::new(tokio::io::stdin()),
+            reader_app,
+            reader_tx,
+            max_line,
+        )
+        .await
+        {
+            tracing::error!("io: reader: {e}");
+        }
+    };
+
+    #[cfg(unix)]
     {
-        tracing::error!("io: reader: {e}");
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).map_err(|e| {
+            AdapterError::Io(std::io::Error::other(format!("sigterm handler: {e}")))
+        })?;
+        tokio::select! {
+            _ = read_fut => {
+                tracing::info!("stdin EOF — shutting down");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM — shutting down");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        read_fut.await;
     }
 
     // Graceful shutdown: cancel in-flight turns and flush state.
+    graceful_shutdown(&app).await;
+
+    drop(wire_tx);
+    let _ = writer.await;
+    Ok(())
+}
+
+async fn graceful_shutdown(app: &App) {
     {
         let sessions = app.sessions.lock().await;
         for s in sessions.values() {
@@ -99,9 +142,6 @@ pub async fn run_server(cfg: Config) -> Result<(), AdapterError> {
     if let Err(e) = app.state.lock().await.flush() {
         tracing::warn!("state flush on shutdown: {e}");
     }
-
-    let _ = writer.await;
-    Ok(())
 }
 
 async fn read_loop<R: tokio::io::AsyncBufRead + Unpin>(
@@ -158,7 +198,38 @@ async fn handle_request(
         "session/prompt" => {
             let app = app.clone();
             let wire_tx = wire_tx.clone();
-            tokio::spawn(async move { session_prompt(&app, id, params, &wire_tx).await });
+            tokio::spawn(async move {
+                // Contain panics so session.busy is cleared and the client
+                // receives a JSON-RPC error instead of hanging forever.
+                let session_id_hint = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let id_for_err = id.clone();
+                let outcome = AssertUnwindSafe(session_prompt(&app, id, params, &wire_tx))
+                    .catch_unwind()
+                    .await;
+                if let Err(panic) = outcome {
+                    let detail = panic_message(&panic);
+                    tracing::error!("session/prompt panicked: {detail}");
+                    if let Some(ref sid) = session_id_hint {
+                        let mut sessions = app.sessions.lock().await;
+                        if let Some(s) = sessions.get_mut(sid) {
+                            s.busy = false;
+                            let _ = s.cancel_tx.send(true);
+                        }
+                    }
+                    wire::send(
+                        &wire_tx,
+                        wire::err(
+                            id_for_err,
+                            -32000,
+                            &format!("session/prompt internal error (panic contained): {detail}"),
+                        ),
+                    )
+                    .await;
+                }
+            });
         }
         "session/cancel" => {
             cancel_session(app, params).await;
@@ -191,6 +262,19 @@ async fn initialize(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSend
             .await;
         }
     };
+
+    // Fail-fast config: missing credentials surface as a clear JSON-RPC error
+    // (process may start without them so the harness can display the message).
+    if let Err(e) = app.cfg.require_intel_credentials() {
+        tracing::error!("initialize failed (config): {e}");
+        return reject(
+            wire_tx,
+            id,
+            e.json_rpc_code(),
+            &format!("initialize failed — configuration error (respawn will not fix this): {e}"),
+        )
+        .await;
+    }
 
     // Fail-fast: probe gateway and resolve agent id.
     let agent_id = match app.intel.resolve_agent_id(&app.cfg.agent).await {
@@ -472,12 +556,16 @@ async fn run_turn(
                 continue;
             }
             Err(AdapterError::IntelAuth(msg)) => {
+                tracing::error!(error = %msg, "intel auth failure");
                 if app.cfg.error_replies {
                     let _ = post_error_reply(
                         app,
                         parsed.channel_id,
                         parsed.reply_to_event_id.as_deref(),
-                        &format!("⚠️ Intel gateway rejected credentials (401/403). {msg}"),
+                        &owner_visible_error(
+                            "credentials rejected (401/403)",
+                            extract_request_id(&msg),
+                        ),
                         epoch,
                         acp_session_id,
                     )
@@ -489,23 +577,14 @@ async fn run_turn(
             Err(e) => {
                 // Transient: one jittered retry only if no SSE frame was received
                 // is handled inside ensure_and_run; here we post error reply.
+                tracing::error!(error = %e, "intel turn failed");
                 if app.cfg.error_replies {
-                    let user_msg = match &e {
-                        AdapterError::Intel(m)
-                            if m.contains("unreachable")
-                                || m.contains("connect")
-                                || m.contains("timeout")
-                                || m.contains("status 5") =>
-                        {
-                            format!("⚠️ Intel platform unreachable. {m}")
-                        }
-                        other => format!("⚠️ Intel turn failed. {other}"),
-                    };
+                    let (category, rid) = classify_owner_error(&e);
                     let _ = post_error_reply(
                         app,
                         parsed.channel_id,
                         parsed.reply_to_event_id.as_deref(),
-                        &user_msg,
+                        &owner_visible_error(&category, rid.as_deref()),
                         epoch,
                         acp_session_id,
                     )
@@ -532,32 +611,15 @@ async fn ensure_and_run(
     wire_tx: &WireSender,
     force_new: bool,
 ) -> Result<String, AdapterError> {
-    let (intel_session_id, is_new, already_forwarded) = {
-        let mut state = app.state.lock().await;
-        if force_new {
-            let _ = state.remove_session(mapping_key);
-        }
-        if let Some(entry) = state.get_session(mapping_key) {
-            (
-                entry.session_id.clone(),
-                false,
-                entry.system_prompt_forwarded,
-            )
-        } else {
-            drop(state);
-            let created = app.intel.create_session(agent_id, entity_id).await?;
-            let entry = SessionEntry {
-                session_id: created.session_id.clone(),
-                entity_id: entity_id.to_owned(),
-                created_at: Utc::now(),
-                last_used_at: Utc::now(),
-                system_prompt_forwarded: false,
-            };
-            let mut state = app.state.lock().await;
-            state.put_session(mapping_key.to_owned(), entry)?;
-            (created.session_id, true, false)
-        }
-    };
+    let (intel_session_id, is_new, already_forwarded) = get_or_create_intel_session(
+        &app.state,
+        &app.create_locks,
+        mapping_key,
+        force_new,
+        entity_id,
+        || app.intel.create_session(agent_id, entity_id),
+    )
+    .await?;
 
     let message = build_outbound_message(
         app.cfg.forward_system_prompt,
@@ -619,7 +681,15 @@ async fn ensure_and_run(
                 |frame: &SseFrame| {
                     received_any_frame = true;
                     let _ = activity_tx.try_send(());
-                    emit_acp_frame(wire_tx, acp_session_id, frame);
+                    // Emit is async with a short timeout so thought/tool updates
+                    // are not silently dropped under mild backpressure, yet the
+                    // SSE loop never blocks indefinitely on a stuck stdout.
+                    let wire_tx = wire_tx.clone();
+                    let sid = acp_session_id.to_owned();
+                    let frame = frame.clone();
+                    async move {
+                        emit_acp_frame(&wire_tx, &sid, &frame).await;
+                    }
                 },
             )
             .await;
@@ -655,16 +725,22 @@ async fn ensure_and_run(
     }
 
     if let Some((code, msg)) = stream.stream_error {
-        let brief = match code {
-            Some(c) => format!("⚠️ Intel error [{c}]: {msg}"),
-            None => format!("⚠️ Intel error: {msg}"),
-        };
+        tracing::error!(
+            code = ?code,
+            error = %msg,
+            request_id = ?stream.request_id,
+            "intel SSE ERROR frame"
+        );
         if app.cfg.error_replies {
+            let category = match code.as_deref() {
+                Some(c) => format!("runtime error [{c}]"),
+                None => "runtime error".into(),
+            };
             let _ = post_error_reply(
                 app,
                 parsed.channel_id,
                 parsed.reply_to_event_id.as_deref(),
-                &brief,
+                &owner_visible_error(&category, stream.request_id.as_deref()),
                 epoch,
                 acp_session_id,
             )
@@ -730,7 +806,7 @@ async fn ensure_and_run(
     Ok("end_turn".into())
 }
 
-fn emit_acp_frame(wire_tx: &WireSender, sid: &str, frame: &SseFrame) {
+async fn emit_acp_frame(wire_tx: &WireSender, sid: &str, frame: &SseFrame) {
     let update = match frame.kind {
         FrameKind::Thinking => {
             // THINKING frames carry no text — emit generic placeholder.
@@ -775,8 +851,87 @@ fn emit_acp_frame(wire_tx: &WireSender, sid: &str, frame: &SseFrame) {
         FrameKind::Error | FrameKind::Done | FrameKind::Other(_) => return,
     };
 
-    // Synchronous try_send preserves frame order (spawned tasks can reorder).
-    let _ = wire_tx.try_send(wire::WireMsg::Notify(wire::session_update(sid, update)));
+    let msg = WireMsg::Notify(wire::session_update(sid, update));
+    match tokio::time::timeout(SESSION_UPDATE_SEND_TIMEOUT, wire_tx.send(msg)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            tracing::warn!("session/update dropped: wire channel closed");
+        }
+        Err(_) => {
+            tracing::warn!(
+                "session/update dropped under backpressure after {}ms",
+                SESSION_UPDATE_SEND_TIMEOUT.as_millis()
+            );
+        }
+    }
+}
+
+/// Channel-visible error text: category + optional request id only (no gateway internals).
+fn owner_visible_error(category: &str, request_id: Option<&str>) -> String {
+    match request_id {
+        Some(rid) if !rid.is_empty() => {
+            format!("⚠️ Intel platform error ({category}; request id: {rid})")
+        }
+        _ => format!("⚠️ Intel platform error ({category})"),
+    }
+}
+
+fn extract_request_id(msg: &str) -> Option<&str> {
+    // Errors append ` x-request-id=<id>` (see intel::map_http_error).
+    msg.split("x-request-id=")
+        .nth(1)
+        .map(|s| s.split_whitespace().next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty())
+}
+
+fn classify_owner_error(e: &AdapterError) -> (String, Option<String>) {
+    let full = e.to_string();
+    let rid = extract_request_id(&full).map(str::to_owned);
+    let category = match e {
+        AdapterError::Intel(m)
+            if m.contains("unreachable")
+                || m.contains("connect")
+                || m.contains("timeout")
+                || m.contains("status 5") =>
+        {
+            "platform unreachable"
+        }
+        AdapterError::IntelAuth(_) => "credentials rejected",
+        AdapterError::IntelSessionGone(_) => "session expired",
+        _ => "turn failed",
+    };
+    (category.to_owned(), rid)
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_visible_error_omits_gateway_internals() {
+        let s = owner_visible_error("platform unreachable", Some("abc-123"));
+        assert!(s.contains("abc-123"));
+        assert!(s.contains("platform unreachable"));
+        assert!(!s.contains("stack"));
+        assert!(!s.contains("internal"));
+    }
+
+    #[test]
+    fn extract_request_id_from_error_suffix() {
+        let msg = "status 500: boom x-request-id=req-99 extra";
+        assert_eq!(extract_request_id(msg), Some("req-99"));
+        assert_eq!(extract_request_id("no rid here"), None);
+    }
 }
 
 fn build_outbound_message(

@@ -232,8 +232,9 @@ impl IntelClient {
     /// `POST /v1/sessions/{id}/messages` and consume the SSE stream.
     ///
     /// `on_frame` is invoked for every parsed frame (for ACP session/update emission).
+    /// It may be async so callers can await-send wire updates with a short timeout.
     /// `cancel` aborts the read loop when set to true.
-    pub async fn send_message_stream<F>(
+    pub async fn send_message_stream<F, Fut>(
         &self,
         session_id: &str,
         message: &str,
@@ -242,7 +243,8 @@ impl IntelClient {
         mut on_frame: F,
     ) -> Result<TurnStreamResult, AdapterError>
     where
-        F: FnMut(&SseFrame),
+        F: FnMut(&SseFrame) -> Fut,
+        Fut: std::future::Future<Output = ()>,
     {
         let url = format!("{}/v1/sessions/{session_id}/messages", self.base);
         let body = json!({
@@ -328,17 +330,24 @@ impl IntelClient {
                 }
             };
 
-            let frames = parser.push(&String::from_utf8_lossy(&chunk));
+            let frames = match parser.push(&chunk) {
+                Ok(f) => f,
+                Err(e) => return Err(e),
+            };
             for frame in frames {
-                if apply_frame(&mut result, &frame, &mut on_frame) {
+                if apply_frame(&mut result, &frame, &mut on_frame).await {
                     return Ok(result);
                 }
             }
         }
 
         // Flush trailing event without blank line.
-        if let Some(frame) = parser.finish() {
-            let _ = apply_frame(&mut result, &frame, &mut on_frame);
+        match parser.finish() {
+            Ok(Some(frame)) => {
+                let _ = apply_frame(&mut result, &frame, &mut on_frame).await;
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e),
         }
 
         Ok(result)
@@ -346,9 +355,14 @@ impl IntelClient {
 }
 
 /// Apply one frame to the turn accumulator; returns true when the stream should stop.
-fn apply_frame<F>(result: &mut TurnStreamResult, frame: &SseFrame, on_frame: &mut F) -> bool
+async fn apply_frame<F, Fut>(
+    result: &mut TurnStreamResult,
+    frame: &SseFrame,
+    on_frame: &mut F,
+) -> bool
 where
-    F: FnMut(&SseFrame),
+    F: FnMut(&SseFrame) -> Fut,
+    Fut: std::future::Future<Output = ()>,
 {
     result.received_frame = true;
     if let Some(ref t) = frame.response_text {
@@ -364,15 +378,25 @@ where
         ));
     }
     let stop = frame.kind == FrameKind::Done || frame.kind == FrameKind::Error;
-    on_frame(frame);
+    on_frame(frame).await;
     stop
 }
 
-/// Incremental SSE parser that tolerates frames split across arbitrary byte chunks.
+/// Hard cap on buffered SSE bytes (incomplete line + accumulated data lines).
+/// Mirrors the ACP NDJSON max line size to bound memory under adversarial streams.
+pub const SSE_BUFFER_CAP: usize = 8 * 1024 * 1024;
+
+/// Incremental SSE parser that tolerates frames split across arbitrary **byte** chunks.
+///
+/// Incomplete UTF-8 sequences at chunk boundaries stay in the byte buffer until a
+/// complete line (`\n`) arrives; only then is the line decoded. This avoids
+/// `from_utf8_lossy` corruption of multi-byte codepoints split by the network.
 #[derive(Debug, Default)]
 pub struct SseByteParser {
-    buf: String,
+    buf: Vec<u8>,
     data_lines: Vec<String>,
+    /// Running total of bytes held in `data_lines` (for the size cap).
+    data_bytes: usize,
     event_name: Option<String>,
 }
 
@@ -382,22 +406,61 @@ impl SseByteParser {
         Self::default()
     }
 
-    /// Push a chunk of SSE bytes and return any complete frames.
-    pub fn push(&mut self, chunk: &str) -> Vec<SseFrame> {
-        self.buf.push_str(chunk);
+    fn buffered_total(&self) -> usize {
+        self.buf.len().saturating_add(self.data_bytes)
+    }
+
+    /// Push a raw byte chunk and return any complete frames.
+    ///
+    /// Returns [`AdapterError::Intel`] when the buffer would exceed
+    /// [`SSE_BUFFER_CAP`] or a complete line is not valid UTF-8.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, AdapterError> {
+        if self
+            .buffered_total()
+            .saturating_add(chunk.len())
+            .saturating_add(1)
+            > SSE_BUFFER_CAP
+        {
+            return Err(AdapterError::Intel(format!(
+                "sse buffer exceeded {SSE_BUFFER_CAP} bytes (possible runaway stream)"
+            )));
+        }
+        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(nl) = self.buf.find('\n') {
-            let mut line = self.buf[..nl].to_owned();
-            self.buf.drain(..=nl);
-            if line.ends_with('\r') {
-                line.pop();
+        loop {
+            let Some(nl) = self.buf.iter().position(|&b| b == b'\n') else {
+                // Incomplete line still in buf — enforce cap on growth.
+                if self.buffered_total() > SSE_BUFFER_CAP {
+                    return Err(AdapterError::Intel(format!(
+                        "sse buffer exceeded {SSE_BUFFER_CAP} bytes (possible runaway stream)"
+                    )));
+                }
+                break;
+            };
+            let mut line_bytes = self.buf.drain(..=nl).collect::<Vec<u8>>();
+            // Drop trailing \n (and optional \r).
+            if line_bytes.last() == Some(&b'\n') {
+                line_bytes.pop();
             }
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
+
+            let line = match String::from_utf8(line_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(AdapterError::Intel(format!(
+                        "sse line is not valid UTF-8: {e}"
+                    )));
+                }
+            };
 
             if line.is_empty() {
                 if let Some(frame) = dispatch_sse_event(self.event_name.take(), &self.data_lines) {
                     out.push(frame);
                 }
                 self.data_lines.clear();
+                self.data_bytes = 0;
                 continue;
             }
 
@@ -406,21 +469,31 @@ impl SseByteParser {
             } else if let Some(rest) = line.strip_prefix("data:") {
                 // Spec: single space after colon is conventional; strip one.
                 let data = rest.strip_prefix(' ').unwrap_or(rest);
+                let add = data.len();
+                if self.data_bytes.saturating_add(add) > SSE_BUFFER_CAP {
+                    return Err(AdapterError::Intel(format!(
+                        "sse data_lines exceeded {SSE_BUFFER_CAP} bytes (possible runaway stream)"
+                    )));
+                }
+                self.data_bytes = self.data_bytes.saturating_add(add);
                 self.data_lines.push(data.to_owned());
             }
             // ignore comments / id: / retry:
         }
-        out
+        Ok(out)
     }
 
     /// Flush a trailing event that was not terminated by a blank line.
-    pub fn finish(&mut self) -> Option<SseFrame> {
+    pub fn finish(&mut self) -> Result<Option<SseFrame>, AdapterError> {
+        // Any residual incomplete line without `\n` is discarded (incomplete SSE).
+        self.buf.clear();
         if self.event_name.is_none() && self.data_lines.is_empty() {
-            return None;
+            return Ok(None);
         }
         let frame = dispatch_sse_event(self.event_name.take(), &self.data_lines);
         self.data_lines.clear();
-        frame
+        self.data_bytes = 0;
+        Ok(frame)
     }
 }
 
@@ -514,12 +587,19 @@ pub fn summarize_error_body(body: &str) -> String {
             return msg.to_owned();
         }
     }
-    // Truncate raw body for logs / user messages.
-    let max = 200;
-    if trimmed.len() > max {
-        format!("{}…", &trimmed[..max])
+    // Truncate raw body for logs / user messages (char-safe — never panic on
+    // multi-byte UTF-8 straddling a byte index).
+    truncate_chars(trimmed, 200)
+}
+
+/// Take at most `max` Unicode scalars; append an ellipsis when truncated.
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    let mut iter = s.chars();
+    let taken: String = iter.by_ref().take(max).collect();
+    if iter.next().is_some() {
+        format!("{taken}…")
     } else {
-        trimmed.to_owned()
+        taken
     }
 }
 
@@ -821,7 +901,7 @@ mod tests {
     #[test]
     fn sse_event_done_terminal() {
         let mut p = SseByteParser::new();
-        let frames = p.push("event: done\n\n");
+        let frames = p.push(b"event: done\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].kind, FrameKind::Done);
     }
@@ -829,7 +909,7 @@ mod tests {
     #[test]
     fn sse_data_done_variants() {
         let mut p = SseByteParser::new();
-        let frames = p.push("data: [DONE]\n\n");
+        let frames = p.push(b"data: [DONE]\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].kind, FrameKind::Done);
     }
@@ -865,9 +945,9 @@ mod tests {
         let mut p = SseByteParser::new();
         let mut frames = Vec::new();
         for w in cuts.windows(2) {
-            frames.extend(p.push(&full[w[0]..w[1]]));
+            frames.extend(p.push(full[w[0]..w[1]].as_bytes()).unwrap());
         }
-        if let Some(f) = p.finish() {
+        if let Some(f) = p.finish().unwrap() {
             frames.push(f);
         }
         assert_eq!(frames.len(), 5);
@@ -880,11 +960,62 @@ mod tests {
         assert_eq!(frames[4].kind, FrameKind::Done);
     }
 
+    /// Multi-byte payload deliberately split mid-codepoint across push() calls
+    /// must reassemble losslessly (no U+FFFD).
+    #[test]
+    fn sse_multibyte_split_mid_codepoint_is_lossless() {
+        // 🔥 = F0 9F 94 A5; Indonesian + emoji reply text.
+        let text = "Jawaban: baik 🔥 terima kasih 测试";
+        let payload = format!(
+            "{{\"event_type\":\"MESSAGE_EVENT_TYPE_RESPONSE\",\"response\":{{\"response\":{}}}}}",
+            serde_json::to_string(text).unwrap()
+        );
+        let line = format!("data: {payload}\n\n");
+        let bytes = line.as_bytes();
+
+        // Find the emoji byte offset inside the full line and split mid-codepoint.
+        let emoji_at = line.find('🔥').expect("emoji present");
+        assert_eq!(
+            &line.as_bytes()[emoji_at..emoji_at + 4],
+            [0xF0, 0x9F, 0x94, 0xA5]
+        );
+        let mid = emoji_at + 2; // middle of the 4-byte sequence
+
+        let mut p = SseByteParser::new();
+        let mut frames = p.push(&bytes[..mid]).unwrap();
+        frames.extend(p.push(&bytes[mid..]).unwrap());
+        if let Some(f) = p.finish().unwrap() {
+            frames.push(f);
+        }
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, FrameKind::Response);
+        assert_eq!(frames[0].response_text.as_deref(), Some(text));
+        assert!(!frames[0]
+            .response_text
+            .as_deref()
+            .unwrap_or("")
+            .contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn sse_buffer_cap_errors_on_runaway_line() {
+        let mut p = SseByteParser::new();
+        // One huge line without newline — must error instead of growing unbounded.
+        let big = vec![b'a'; SSE_BUFFER_CAP + 1];
+        let err = p.push(&big).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sse buffer exceeded") || msg.contains("runaway"),
+            "unexpected err: {msg}"
+        );
+    }
+
     #[test]
     fn sse_error_frame_stops_with_message() {
         let mut p = SseByteParser::new();
-        let frames =
-            p.push("data: {\"event_type\":\"ERROR\",\"code\":\"X\",\"message\":\"nope\"}\n\n");
+        let frames = p
+            .push(b"data: {\"event_type\":\"ERROR\",\"code\":\"X\",\"message\":\"nope\"}\n\n")
+            .unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].kind, FrameKind::Error);
         assert_eq!(frames[0].error_code.as_deref(), Some("X"));
@@ -911,5 +1042,34 @@ mod tests {
 
         let e = map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", None);
         assert!(matches!(e, AdapterError::Intel(_)));
+    }
+
+    #[test]
+    fn summarize_error_body_truncates_multibyte_safely() {
+        // Build a body where byte index 200 lands mid multi-byte char.
+        // "测" is 3 bytes; pad with ASCII then many CJK so char-truncation is exercised.
+        let mut body = "x".repeat(199);
+        body.push('测'); // if we sliced at byte 200 we'd panic mid-char
+        body.push_str(&"测".repeat(50));
+        let out = summarize_error_body(&body);
+        // Must not panic; must be truncated with ellipsis; must be valid UTF-8.
+        assert!(out.ends_with('…'), "expected ellipsis, got {out:?}");
+        assert!(!out.contains('\u{FFFD}'));
+        // Char-safe: every char is complete.
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    #[test]
+    fn truncate_chars_mid_emoji() {
+        let s = format!("{}🔥", "a".repeat(10));
+        // 11 scalars = 10 'a's + full emoji — no truncation.
+        let t = truncate_chars(&s, 11);
+        assert_eq!(t, format!("{}🔥", "a".repeat(10)));
+        // 10 scalars leaves the emoji out → truncated with ellipsis.
+        let t2 = truncate_chars(&s, 10);
+        assert_eq!(t2, format!("{}…", "a".repeat(10)));
+        let t3 = truncate_chars(&format!("{}🔥extra", "a".repeat(10)), 11);
+        assert!(t3.ends_with('…'));
+        assert!(t3.contains('🔥'));
     }
 }

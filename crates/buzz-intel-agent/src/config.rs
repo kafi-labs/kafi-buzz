@@ -212,17 +212,19 @@ pub struct Config {
 
 impl Config {
     /// Build config from parsed CLI (which already merges env via clap).
+    ///
+    /// Missing `INTEL_GATEWAY_URL` / API key / `INTEL_AGENT` are allowed here so
+    /// the ACP server can start and return a clear JSON-RPC error from
+    /// `initialize`. Call [`Config::require_intel_credentials`] for one-shot
+    /// modes (`--auth-probe`, `--list-agents`) and inside `initialize`.
     pub fn from_cli(cli: &Cli) -> Result<Self, AdapterError> {
         let gateway_url = cli
             .gateway_url
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                AdapterError::Config("INTEL_GATEWAY_URL is required (or pass --gateway-url)".into())
-            })?
-            .trim_end_matches('/')
-            .to_owned();
+            .map(|s| s.trim_end_matches('/').to_owned())
+            .unwrap_or_default();
 
         let api_key = resolve_api_key(cli)?;
         let agent = cli
@@ -230,10 +232,8 @@ impl Config {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                AdapterError::Config("INTEL_AGENT is required (or pass --agent)".into())
-            })?
-            .to_owned();
+            .map(str::to_owned)
+            .unwrap_or_default();
 
         let org_id = cli
             .org_id
@@ -287,10 +287,31 @@ impl Config {
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
         })
     }
+
+    /// Fail if intel gateway credentials required for operation are missing.
+    pub fn require_intel_credentials(&self) -> Result<(), AdapterError> {
+        if self.gateway_url.is_empty() {
+            return Err(AdapterError::Config(
+                "INTEL_GATEWAY_URL is required (or pass --gateway-url)".into(),
+            ));
+        }
+        if self.api_key.is_empty() {
+            return Err(AdapterError::Config(
+                "INTEL_API_KEY or INTEL_API_KEY_FILE is required (or pass --api-key)".into(),
+            ));
+        }
+        if self.agent.is_empty() {
+            return Err(AdapterError::Config(
+                "INTEL_AGENT is required (or pass --agent)".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn resolve_api_key(cli: &Cli) -> Result<String, AdapterError> {
     if let Some(ref path) = cli.api_key_file {
+        warn_if_key_file_world_readable(path);
         let raw = std::fs::read_to_string(path).map_err(|e| {
             AdapterError::Config(format!(
                 "failed to read INTEL_API_KEY_FILE {}: {e}",
@@ -303,16 +324,44 @@ fn resolve_api_key(cli: &Cli) -> Result<String, AdapterError> {
         }
         return Ok(key);
     }
-    cli.api_key
+    Ok(cli
+        .api_key
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| {
-            AdapterError::Config(
-                "INTEL_API_KEY or INTEL_API_KEY_FILE is required (or pass --api-key)".into(),
-            )
-        })
+        .unwrap_or_default())
+}
+
+/// Warn (do not fail) when the API key file is group/world-readable.
+fn warn_if_key_file_world_readable(path: &PathBuf) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode();
+                if mode & 0o077 != 0 {
+                    let msg = format!(
+                        "INTEL_API_KEY_FILE {} is group/world-accessible (mode {:o}); \
+                         prefer chmod 600",
+                        path.display(),
+                        mode & 0o777
+                    );
+                    // tracing may not be initialised yet during CLI parse.
+                    eprintln!("warning: {msg}");
+                    tracing::warn!("{msg}");
+                }
+            }
+            Err(e) => {
+                tracing::debug!("could not stat INTEL_API_KEY_FILE {}: {e}", path.display());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 fn resolve_state_path(override_dir: Option<&PathBuf>) -> Result<PathBuf, AdapterError> {

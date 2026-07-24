@@ -15,6 +15,7 @@ pub mod error;
 pub mod intel;
 pub mod prompt;
 pub mod reply;
+pub mod session_ensure;
 pub mod state;
 pub mod wire;
 
@@ -28,13 +29,16 @@ use crate::intel::IntelClient;
 pub async fn run() -> Result<(), AdapterError> {
     let cli = Cli::parse();
 
-    // One-shot modes still need gateway credentials.
+    // Missing intel credentials are allowed for the ACP server path so
+    // `initialize` can return a JSON-RPC error; one-shot modes still require them.
     let cfg = Config::from_cli(&cli)?;
 
     if cli.auth_probe {
+        cfg.require_intel_credentials()?;
         return auth_probe(&cfg).await;
     }
     if cli.list_agents {
+        cfg.require_intel_credentials()?;
         return list_agents(&cfg).await;
     }
 
