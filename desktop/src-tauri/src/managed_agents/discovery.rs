@@ -188,6 +188,41 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         login_hint: None,
         auth_probe_args: None,
     },
+    KnownAcpRuntime {
+        id: "intel",
+        label: "Intelligence Platform",
+        commands: &["buzz-intel-agent"],
+        aliases: &[],
+        avatar_url: "",
+        mcp_command: None,
+        mcp_hooks: false,
+        underlying_cli: None,
+        cli_install_commands: &[],
+        cli_install_commands_windows: &[],
+        adapter_install_commands: &[],
+        install_instructions_url: "https://github.com/block/buzz",
+        cli_install_hint: "Build via `cargo build -p buzz-intel-agent` (ships with Buzz agent tooling).",
+        adapter_install_hint: "",
+        skill_dir: None,
+        supports_acp_model_switching: false,
+        // "model" dropdown = which deployed intel agent (INTEL_AGENT).
+        model_env_var: Some("INTEL_AGENT"),
+        // Gateway URL is the fixed "provider" surface for this runtime.
+        provider_env_var: Some("INTEL_GATEWAY_URL"),
+        provider_locked: true,
+        default_env: &[],
+        config_file_path: None,
+        config_file_format: None,
+        supports_acp_native_config: false,
+        thinking_env_var: None,
+        max_tokens_env_var: None,
+        context_limit_env_var: None,
+        // model → agent name; provider → gateway URL (see env vars above).
+        required_normalized_fields: &["model", "provider"],
+        login_hint: Some("Set INTEL_API_KEY (mint on your gateway)"),
+        // args[0] is the executable (runtime_metadata.rs:60-62), not the flag.
+        auth_probe_args: Some(&["buzz-intel-agent", "--auth-probe"]),
+    },
 ];
 
 /// Skill discovery directories declared by known runtimes.
