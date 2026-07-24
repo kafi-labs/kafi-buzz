@@ -194,5 +194,46 @@ mod tests {
                 .unwrap();
         }
         assert!(store.data.sessions.len() <= MAX_SESSIONS);
+        // Oldest keys (lowest last_used_at) must be gone.
+        assert!(store.get_session("k0").is_none());
+        assert!(store.get_session("k1").is_none());
+        // Newest must remain.
+        assert!(store
+            .get_session(&format!("k{}", MAX_SESSIONS + 4))
+            .is_some());
+    }
+
+    #[test]
+    fn remove_and_touch_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let mut store = StateStore::load(&path).unwrap();
+        store
+            .put_session(
+                "ch".into(),
+                SessionEntry {
+                    session_id: "s1".into(),
+                    entity_id: "e1".into(),
+                    created_at: Utc::now(),
+                    last_used_at: Utc::now(),
+                    system_prompt_forwarded: false,
+                },
+            )
+            .unwrap();
+        store.touch_session("ch", true).unwrap();
+        assert!(store.get_session("ch").unwrap().system_prompt_forwarded);
+        store.remove_session("ch").unwrap();
+        let reloaded = StateStore::load(&path).unwrap();
+        assert!(reloaded.get_session("ch").is_none());
+    }
+
+    #[test]
+    fn corrupt_state_file_starts_fresh() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, b"not-json{{{").unwrap();
+        let store = StateStore::load(&path).unwrap();
+        assert!(store.agent_id().is_none());
+        assert!(store.get_session("x").is_none());
     }
 }

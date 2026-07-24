@@ -165,4 +165,116 @@ Content: newer";
             Some("2222222222222222222222222222222222222222222222222222222222222222")
         );
     }
+
+    #[test]
+    fn reply_instruction_preferred_over_newest_event() {
+        // Two events; reply-instruction points at the first (matching harness).
+        let text = "\
+Event ID: 1111111111111111111111111111111111111111111111111111111111111111\n\
+Channel: general (#aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)\n\
+Content: older\n\
+\n\
+Event ID: 2222222222222222222222222222222222222222222222222222222222222222\n\
+Channel: general (#aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)\n\
+Content: newer\n\
+\n\
+IMPORTANT: For ordinary replies in this turn, use `--reply-to 1111111111111111111111111111111111111111111111111111111111111111` \
+on `buzz messages send` so the conversation stays threaded.";
+        let p = parse_prompt(text);
+        assert_eq!(
+            p.channel_id,
+            Some(Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap())
+        );
+        assert_eq!(
+            p.reply_to_event_id.as_deref(),
+            Some("1111111111111111111111111111111111111111111111111111111111111111")
+        );
+    }
+
+    #[test]
+    fn plain_reply_to_without_backticks() {
+        let text = "\
+Event ID: abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd\n\
+Channel: 11111111-2222-3333-4444-555555555555\n\
+\n\
+Please use --reply-to abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd on buzz messages send.";
+        let p = parse_prompt(text);
+        assert_eq!(
+            p.reply_to_event_id.as_deref(),
+            Some("abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd")
+        );
+    }
+
+    #[test]
+    fn malformed_channel_and_short_event_ids_tolerated() {
+        let text = "\
+Event ID: not-a-hex-id\n\
+Channel: not-a-uuid\n\
+Content: still goes through\n\
+Event ID: deadbeef\n\
+Channel: (#bad)";
+        let p = parse_prompt(text);
+        assert!(p.channel_id.is_none());
+        assert!(p.reply_to_event_id.is_none());
+    }
+
+    #[test]
+    fn fixture_matches_queue_named_and_bare_renderings() {
+        // Mirrors buzz-acp queue.rs format_event_block channel_display branches
+        // and append_reply_instruction wording.
+        let named = format_fixture(
+            "9999999999999999999999999999999999999999999999999999999999999999",
+            "random (#c0ffee00-0000-4000-8000-000000000001)",
+            true,
+        );
+        let bare = format_fixture(
+            "8888888888888888888888888888888888888888888888888888888888888888",
+            "c0ffee00-0000-4000-8000-000000000001",
+            false,
+        );
+        let pn = parse_prompt(&named);
+        assert_eq!(
+            pn.channel_id,
+            Some(Uuid::parse_str("c0ffee00-0000-4000-8000-000000000001").unwrap())
+        );
+        assert_eq!(
+            pn.reply_to_event_id.as_deref(),
+            Some("9999999999999999999999999999999999999999999999999999999999999999")
+        );
+        let pb = parse_prompt(&bare);
+        assert_eq!(
+            pb.channel_id,
+            Some(Uuid::parse_str("c0ffee00-0000-4000-8000-000000000001").unwrap())
+        );
+        assert_eq!(
+            pb.reply_to_event_id.as_deref(),
+            Some("8888888888888888888888888888888888888888888888888888888888888888")
+        );
+    }
+
+    fn format_fixture(
+        event_id: &str,
+        channel_display: &str,
+        with_reply_instruction: bool,
+    ) -> String {
+        let mut s = format!(
+            "Event ID: {event_id}\n\
+             Channel: {channel_display}\n\
+             Kind: 9\n\
+             From: npub1test (hex: deadbeef)\n\
+             Time: 2026-07-24T00:00:00Z\n\
+             Content: @agent help\n\
+             Tags: [[\"h\",\"c0ffee00-0000-4000-8000-000000000001\"]]"
+        );
+        if with_reply_instruction {
+            s.push_str(&format!(
+                "\nIMPORTANT: For ordinary replies in this turn, use `--reply-to {event_id}` \
+                 on `buzz messages send` so the conversation stays threaded. \
+                 If the human explicitly asks for a channel-root, top-level, \
+                 or broadcast post, send that message without `--reply-to`. \
+                 If the requested destination is ambiguous, ask before sending."
+            ));
+        }
+        s
+    }
 }

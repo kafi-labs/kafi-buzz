@@ -294,9 +294,7 @@ impl IntelClient {
         };
 
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
-        let mut data_lines: Vec<String> = Vec::new();
-        let mut event_name: Option<String> = None;
+        let mut parser = SseByteParser::new();
 
         loop {
             if *cancel.borrow() {
@@ -330,75 +328,99 @@ impl IntelClient {
                 }
             };
 
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(nl) = buf.find('\n') {
-                let mut line = buf[..nl].to_owned();
-                buf.drain(..=nl);
-                if line.ends_with('\r') {
-                    line.pop();
+            let frames = parser.push(&String::from_utf8_lossy(&chunk));
+            for frame in frames {
+                if apply_frame(&mut result, &frame, &mut on_frame) {
+                    return Ok(result);
                 }
-
-                if line.is_empty() {
-                    // Dispatch accumulated event.
-                    if let Some(frame) = dispatch_sse_event(event_name.take(), &data_lines) {
-                        result.received_frame = true;
-                        if let Some(ref t) = frame.response_text {
-                            result.response_text.push_str(t);
-                        }
-                        if frame.kind == FrameKind::Error {
-                            result.stream_error = Some((
-                                frame.error_code.clone(),
-                                frame
-                                    .error_message
-                                    .clone()
-                                    .unwrap_or_else(|| "unknown error".into()),
-                            ));
-                        }
-                        let is_done = frame.kind == FrameKind::Done;
-                        on_frame(&frame);
-                        if is_done || frame.kind == FrameKind::Error {
-                            return Ok(result);
-                        }
-                    }
-                    data_lines.clear();
-                    continue;
-                }
-
-                if let Some(rest) = line.strip_prefix("event:") {
-                    event_name = Some(rest.trim().to_owned());
-                } else if let Some(rest) = line.strip_prefix("data:") {
-                    // Spec: single space after colon is conventional; strip one.
-                    let data = if let Some(s) = rest.strip_prefix(' ') {
-                        s
-                    } else {
-                        rest
-                    };
-                    data_lines.push(data.to_owned());
-                }
-                // ignore comments / id: / retry:
             }
         }
 
         // Flush trailing event without blank line.
-        if let Some(frame) = dispatch_sse_event(event_name, &data_lines) {
-            result.received_frame = true;
-            if let Some(ref t) = frame.response_text {
-                result.response_text.push_str(t);
-            }
-            if frame.kind == FrameKind::Error {
-                result.stream_error = Some((
-                    frame.error_code.clone(),
-                    frame
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| "unknown error".into()),
-                ));
-            }
-            on_frame(&frame);
+        if let Some(frame) = parser.finish() {
+            let _ = apply_frame(&mut result, &frame, &mut on_frame);
         }
 
         Ok(result)
+    }
+}
+
+/// Apply one frame to the turn accumulator; returns true when the stream should stop.
+fn apply_frame<F>(result: &mut TurnStreamResult, frame: &SseFrame, on_frame: &mut F) -> bool
+where
+    F: FnMut(&SseFrame),
+{
+    result.received_frame = true;
+    if let Some(ref t) = frame.response_text {
+        result.response_text.push_str(t);
+    }
+    if frame.kind == FrameKind::Error {
+        result.stream_error = Some((
+            frame.error_code.clone(),
+            frame
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "unknown error".into()),
+        ));
+    }
+    let stop = frame.kind == FrameKind::Done || frame.kind == FrameKind::Error;
+    on_frame(frame);
+    stop
+}
+
+/// Incremental SSE parser that tolerates frames split across arbitrary byte chunks.
+#[derive(Debug, Default)]
+pub struct SseByteParser {
+    buf: String,
+    data_lines: Vec<String>,
+    event_name: Option<String>,
+}
+
+impl SseByteParser {
+    /// Create an empty parser.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push a chunk of SSE bytes and return any complete frames.
+    pub fn push(&mut self, chunk: &str) -> Vec<SseFrame> {
+        self.buf.push_str(chunk);
+        let mut out = Vec::new();
+        while let Some(nl) = self.buf.find('\n') {
+            let mut line = self.buf[..nl].to_owned();
+            self.buf.drain(..=nl);
+            if line.ends_with('\r') {
+                line.pop();
+            }
+
+            if line.is_empty() {
+                if let Some(frame) = dispatch_sse_event(self.event_name.take(), &self.data_lines) {
+                    out.push(frame);
+                }
+                self.data_lines.clear();
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("event:") {
+                self.event_name = Some(rest.trim().to_owned());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                // Spec: single space after colon is conventional; strip one.
+                let data = rest.strip_prefix(' ').unwrap_or(rest);
+                self.data_lines.push(data.to_owned());
+            }
+            // ignore comments / id: / retry:
+        }
+        out
+    }
+
+    /// Flush a trailing event that was not terminated by a blank line.
+    pub fn finish(&mut self) -> Option<SseFrame> {
+        if self.event_name.is_none() && self.data_lines.is_empty() {
+            return None;
+        }
+        let frame = dispatch_sse_event(self.event_name.take(), &self.data_lines);
+        self.data_lines.clear();
+        frame
     }
 }
 
@@ -727,6 +749,18 @@ mod tests {
     }
 
     #[test]
+    fn error_envelope_fastapi_string_detail() {
+        let body = r#"{"detail":"session stopped"}"#;
+        assert_eq!(summarize_error_body(body), "session stopped");
+    }
+
+    #[test]
+    fn error_envelope_empty_and_plain() {
+        assert_eq!(summarize_error_body(""), "empty body");
+        assert_eq!(summarize_error_body("  not-json  "), "not-json");
+    }
+
+    #[test]
     fn response_text_fallbacks() {
         let v = json!({"event_type":"MESSAGE_EVENT_TYPE_RESPONSE","response":{"response":"hi"}});
         assert_eq!(extract_response_text(&v).as_deref(), Some("hi"));
@@ -739,11 +773,143 @@ mod tests {
 
         let v = json!({"output":"out"});
         assert_eq!(extract_response_text(&v).as_deref(), Some("out"));
+
+        // Nested response object content field.
+        let v = json!({"response":{"content":"nested-content"}});
+        assert_eq!(extract_response_text(&v).as_deref(), Some("nested-content"));
     }
 
     #[test]
     fn classify_thinking() {
         let f = classify_payload(json!({"event_type":"MESSAGE_EVENT_TYPE_THINKING"}));
         assert_eq!(f.kind, FrameKind::Thinking);
+    }
+
+    #[test]
+    fn classify_error_frame() {
+        let f = classify_payload(json!({
+            "event_type": "MESSAGE_EVENT_TYPE_ERROR",
+            "code": "TURN_FAILED",
+            "message": "boom"
+        }));
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.error_code.as_deref(), Some("TURN_FAILED"));
+        assert_eq!(f.error_message.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn classify_tool_call_and_result() {
+        let call = classify_payload(json!({
+            "event_type": "MESSAGE_EVENT_TYPE_TOOL_CALL",
+            "id": "tc-1",
+            "name": "search"
+        }));
+        assert_eq!(call.kind, FrameKind::ToolCall);
+        assert_eq!(call.tool_id.as_deref(), Some("tc-1"));
+        assert_eq!(call.tool_title.as_deref(), Some("search"));
+
+        let result = classify_payload(json!({
+            "event_type": "MESSAGE_EVENT_TYPE_TOOL_RESULT",
+            "tool_call_id": "tc-1",
+            "content": "found it"
+        }));
+        assert_eq!(result.kind, FrameKind::ToolResult);
+        assert_eq!(result.tool_id.as_deref(), Some("tc-1"));
+        assert_eq!(result.tool_content.as_deref(), Some("found it"));
+    }
+
+    #[test]
+    fn sse_event_done_terminal() {
+        let mut p = SseByteParser::new();
+        let frames = p.push("event: done\n\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, FrameKind::Done);
+    }
+
+    #[test]
+    fn sse_data_done_variants() {
+        let mut p = SseByteParser::new();
+        let frames = p.push("data: [DONE]\n\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, FrameKind::Done);
+    }
+
+    #[test]
+    fn sse_frames_split_across_chunk_boundaries() {
+        // Multi-frame stream with awkward mid-line and mid-event splits.
+        let full = concat!(
+            "data: {\"event_type\":\"MESSAGE_EVENT_TYPE_THINKING\"}\n\n",
+            "data: {\"event_type\":\"MESSAGE_EVENT_TYPE_TOOL_CALL\",\"id\":\"t1\",\"title\":\"lookup\"}\n\n",
+            "data: {\"event_type\":\"MESSAGE_EVENT_TYPE_TOOL_RESULT\",\"id\":\"t1\",\"content\":\"ok\"}\n\n",
+            "data: {\"event_type\":\"MESSAGE_EVENT_TYPE_RESPONSE\",\"response\":{\"response\":\"final answer\"}}\n\n",
+            "event: done\n\n",
+        );
+        // Split into awkward chunks: mid-line, mid-JSON, 1-byte slices.
+        let mut cuts = vec![0usize];
+        let mut i = 1usize;
+        while i < full.len() {
+            // Vary step size so frames cross chunk boundaries.
+            let step = match i % 5 {
+                0 => 1,
+                1 => 3,
+                2 => 7,
+                3 => 13,
+                _ => 17,
+            };
+            i = (i + step).min(full.len());
+            cuts.push(i);
+        }
+        if *cuts.last().unwrap() != full.len() {
+            cuts.push(full.len());
+        }
+        let mut p = SseByteParser::new();
+        let mut frames = Vec::new();
+        for w in cuts.windows(2) {
+            frames.extend(p.push(&full[w[0]..w[1]]));
+        }
+        if let Some(f) = p.finish() {
+            frames.push(f);
+        }
+        assert_eq!(frames.len(), 5);
+        assert_eq!(frames[0].kind, FrameKind::Thinking);
+        assert_eq!(frames[1].kind, FrameKind::ToolCall);
+        assert_eq!(frames[1].tool_id.as_deref(), Some("t1"));
+        assert_eq!(frames[2].kind, FrameKind::ToolResult);
+        assert_eq!(frames[3].kind, FrameKind::Response);
+        assert_eq!(frames[3].response_text.as_deref(), Some("final answer"));
+        assert_eq!(frames[4].kind, FrameKind::Done);
+    }
+
+    #[test]
+    fn sse_error_frame_stops_with_message() {
+        let mut p = SseByteParser::new();
+        let frames =
+            p.push("data: {\"event_type\":\"ERROR\",\"code\":\"X\",\"message\":\"nope\"}\n\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, FrameKind::Error);
+        assert_eq!(frames[0].error_code.as_deref(), Some("X"));
+        assert_eq!(frames[0].error_message.as_deref(), Some("nope"));
+    }
+
+    #[test]
+    fn map_http_error_status_classes() {
+        let e = map_http_error(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":{"code":"UNAUTHENTICATED","message":"bad key"}}"#,
+            Some("rid-1"),
+        );
+        match e {
+            AdapterError::IntelAuth(s) => {
+                assert!(s.contains("401"));
+                assert!(s.contains("rid-1"));
+            }
+            other => panic!("expected IntelAuth, got {other:?}"),
+        }
+
+        let e = map_http_error(StatusCode::CONFLICT, r#"{"detail":"stopped"}"#, None);
+        assert!(matches!(e, AdapterError::IntelSessionGone(_)));
+
+        let e = map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", None);
+        assert!(matches!(e, AdapterError::Intel(_)));
     }
 }

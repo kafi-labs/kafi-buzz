@@ -769,25 +769,14 @@ fn emit_acp_frame(wire_tx: &WireSender, sid: &str, frame: &SseFrame) {
             })
         }
         FrameKind::Response => {
-            // Accumulated at end; optional mid-stream emit if text present.
-            if let Some(ref t) = frame.response_text {
-                if !t.is_empty() {
-                    // Defer final emit to end of turn for coherence; still
-                    // keepalive via a thought if we want — skip here.
-                    let _ = t;
-                }
-            }
+            // Accumulated at end; final agent_message_chunk is emitted after post.
             return;
         }
         FrameKind::Error | FrameKind::Done | FrameKind::Other(_) => return,
     };
 
-    // Fire-and-forget; wire channel is unbounded-enough for progress.
-    let wire_tx = wire_tx.clone();
-    let sid = sid.to_owned();
-    tokio::spawn(async move {
-        wire::send(&wire_tx, wire::session_update(&sid, update)).await;
-    });
+    // Synchronous try_send preserves frame order (spawned tasks can reorder).
+    let _ = wire_tx.try_send(wire::WireMsg::Notify(wire::session_update(sid, update)));
 }
 
 fn build_outbound_message(

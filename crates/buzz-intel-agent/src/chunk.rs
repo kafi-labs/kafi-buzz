@@ -74,9 +74,51 @@ mod tests {
         for c in &chunks {
             assert!(c.len() <= CHUNK_SOFT_LIMIT + 100);
         }
-        assert_eq!(
-            chunks.join("\n\n").replace("\n\n\n\n", "\n\n").len() > 0,
-            true
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn exact_soft_limit_is_single_chunk() {
+        let text = "x".repeat(CHUNK_SOFT_LIMIT);
+        let chunks = chunk_content(&text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), CHUNK_SOFT_LIMIT);
+    }
+
+    #[test]
+    fn one_byte_over_soft_limit_splits() {
+        // Two paragraphs: first almost fills the window so split lands on \n\n.
+        let head = "h".repeat(CHUNK_SOFT_LIMIT - 10);
+        let text = format!("{head}\n\n{}", "t".repeat(100));
+        let chunks = chunk_content(&text);
+        assert!(
+            chunks.len() >= 2,
+            "expected split, got {} chunks",
+            chunks.len()
         );
+        for c in &chunks {
+            assert!(
+                c.len() <= CHUNK_SOFT_LIMIT,
+                "chunk len {} exceeds soft limit",
+                c.len()
+            );
+        }
+        // Reassembly preserves payload (trim only drops the split whitespace).
+        let rejoined = chunks.join("\n\n");
+        assert!(rejoined.contains('h') && rejoined.contains('t'));
+    }
+
+    #[test]
+    fn splits_on_single_newline_when_no_paragraph_break() {
+        let line = format!("{}\n", "a".repeat(80));
+        let mut text = String::new();
+        while text.len() < CHUNK_SOFT_LIMIT + 200 {
+            text.push_str(&line);
+        }
+        let chunks = chunk_content(&text);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.len() <= CHUNK_SOFT_LIMIT);
+        }
     }
 }
