@@ -36,14 +36,19 @@ impl SessionMode {
 }
 
 /// How `entity_id` is derived for intel memory scoping.
+///
+/// Emitted ids are OpenViking-safe: `[a-z0-9]+` only
+/// (`buzzchannel<hex>` / `buzzowner<hex>` / `buzzagent<hex>`). Dashes and
+/// colons from UUIDs/pubkeys are stripped. Colons in the old
+/// `buzz:channel:…` form were rejected by OpenViking's `X-OpenViking-User`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EntityMode {
-    /// `buzz:channel:{uuid}` (default).
+    /// `buzzchannel{uuid_hex}` (default).
     #[default]
     Channel,
-    /// `buzz:owner:{owner_pubkey}`.
+    /// `buzzowner{owner_pubkey_hex}`.
     Owner,
-    /// `buzz:agent:{agent_pubkey}`.
+    /// `buzzagent{agent_pubkey_hex}`.
     Agent,
 }
 

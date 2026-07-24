@@ -932,6 +932,67 @@ mod tests {
         assert_eq!(extract_request_id(msg), Some("req-99"));
         assert_eq!(extract_request_id("no rid here"), None);
     }
+
+    fn assert_alphanumeric_entity_id(id: &str) {
+        assert!(
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "entity_id must match [a-z0-9]+, got {id:?}"
+        );
+    }
+
+    #[test]
+    fn entity_id_channel_is_alphanumeric_and_strips_uuid_dashes() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let id = format_entity_id(EntityMode::Channel, uuid);
+        assert_eq!(id, "buzzchannel550e8400e29b41d4a716446655440000");
+        assert_alphanumeric_entity_id(&id);
+    }
+
+    #[test]
+    fn entity_id_owner_strips_colons_and_dashes() {
+        let pubkey = "aa:bb-cc:DD";
+        let id = format_entity_id(EntityMode::Owner, pubkey);
+        assert_eq!(id, "buzzowneraabbccdd");
+        assert_alphanumeric_entity_id(&id);
+    }
+
+    #[test]
+    fn entity_id_agent_is_alphanumeric() {
+        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let id = format_entity_id(EntityMode::Agent, pubkey);
+        assert_eq!(id, format!("buzzagent{pubkey}"));
+        assert_alphanumeric_entity_id(&id);
+    }
+
+    #[test]
+    fn entity_id_unknown_fallback_is_alphanumeric() {
+        for mode in [EntityMode::Channel, EntityMode::Owner, EntityMode::Agent] {
+            let id = format_entity_id(mode, "unknown");
+            assert_alphanumeric_entity_id(&id);
+            assert!(id.ends_with("unknown"), "got {id}");
+        }
+        // Empty / punctuation-only collapses to "unknown" suffix.
+        let id = format_entity_id(EntityMode::Channel, ":::---");
+        assert_eq!(id, "buzzchannelunknown");
+        assert_alphanumeric_entity_id(&id);
+    }
+
+    #[test]
+    fn entity_id_rejects_legacy_colon_form() {
+        // Regression: OpenViking rejects non-alphanumeric X-OpenViking-User.
+        let legacy = format!("buzz:channel:{}", "550e8400-e29b-41d4-a716-446655440000");
+        assert!(
+            legacy.chars().any(|c| !c.is_ascii_alphanumeric()),
+            "sanity: legacy form has non-alnum"
+        );
+        let id = format_entity_id(EntityMode::Channel, "550e8400-e29b-41d4-a716-446655440000");
+        assert!(!id.contains(':'));
+        assert!(!id.contains('-'));
+        assert_alphanumeric_entity_id(&id);
+    }
 }
 
 fn build_outbound_message(
@@ -973,17 +1034,47 @@ fn session_mapping_key(
     }
 }
 
+/// Strip non-alphanumeric characters and lowercase so OpenViking accepts the
+/// value as `X-OpenViking-User` (must be `[a-z0-9]+`).
+fn alphanumeric_entity_suffix(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".into()
+    } else {
+        cleaned
+    }
+}
+
+/// Build a stable, alphanumeric-only `entity_id` for intel session metadata.
+///
+/// Formats (per `INTEL_ENTITY_MODE`):
+/// - channel → `buzzchannel{uuid_hex}`
+/// - owner → `buzzowner{pubkey_hex}`
+/// - agent → `buzzagent{pubkey_hex}`
+fn format_entity_id(mode: EntityMode, raw: &str) -> String {
+    let suffix = alphanumeric_entity_suffix(raw);
+    match mode {
+        EntityMode::Channel => format!("buzzchannel{suffix}"),
+        EntityMode::Owner => format!("buzzowner{suffix}"),
+        EntityMode::Agent => format!("buzzagent{suffix}"),
+    }
+}
+
 fn build_entity_id(
     app: &App,
     parsed: &crate::prompt::ParsedPrompt,
 ) -> Result<String, AdapterError> {
     match app.cfg.entity_mode {
         EntityMode::Channel => {
-            if let Some(ch) = parsed.channel_id {
-                Ok(format!("buzz:channel:{ch}"))
-            } else {
-                Ok("buzz:channel:unknown".into())
-            }
+            let raw = parsed
+                .channel_id
+                .map(|ch| ch.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            Ok(format_entity_id(EntityMode::Channel, &raw))
         }
         EntityMode::Owner => {
             let owner = app
@@ -991,7 +1082,7 @@ fn build_entity_id(
                 .as_ref()
                 .and_then(|r| r.owner_pubkey_hex())
                 .unwrap_or_else(|| "unknown".into());
-            Ok(format!("buzz:owner:{owner}"))
+            Ok(format_entity_id(EntityMode::Owner, &owner))
         }
         EntityMode::Agent => {
             let agent = app
@@ -999,7 +1090,7 @@ fn build_entity_id(
                 .as_ref()
                 .map(|r| r.agent_pubkey_hex())
                 .unwrap_or_else(|| "unknown".into());
-            Ok(format!("buzz:agent:{agent}"))
+            Ok(format_entity_id(EntityMode::Agent, &agent))
         }
     }
 }
