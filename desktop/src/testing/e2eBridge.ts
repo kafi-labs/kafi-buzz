@@ -6912,11 +6912,11 @@ function withMockRuntimeConfigMetadata(
     provider_locked:
       "provider_locked" in runtime
         ? runtime.provider_locked
-        : runtime.id === "claude" ||
+        : !!(
+            runtime.id === "claude" ||
             runtime.id === "codex" ||
             runtime.id === "intel"
-          ? true
-          : false,
+          ),
     required_normalized_fields:
       "required_normalized_fields" in runtime
         ? runtime.required_normalized_fields

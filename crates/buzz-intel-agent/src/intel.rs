@@ -945,7 +945,7 @@ mod tests {
         let mut p = SseByteParser::new();
         let mut frames = Vec::new();
         for w in cuts.windows(2) {
-            frames.extend(p.push(full[w[0]..w[1]].as_bytes()).unwrap());
+            frames.extend(p.push(&full.as_bytes()[w[0]..w[1]]).unwrap());
         }
         if let Some(f) = p.finish().unwrap() {
             frames.push(f);

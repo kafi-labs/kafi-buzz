@@ -307,7 +307,10 @@ const overrides = new Map([
   // None regression, .cmd shim resolution, no-git-bash error hint.
   // +32: deterministic .cmd resolver + no-registry + install_shell_from tests.
   // Managed-path resolution test split to discovery/tests/managed_path_resolution.rs.
-  ["src-tauri/src/managed_agents/discovery/tests.rs", 1273],
+  // +63: intel ACP runtime catalog — provider_locked / free-text gateway fields
+  // + create-flow wiring coverage in discovery tests. Load-bearing feature tests;
+  // queued to split with the rest of this list.
+  ["src-tauri/src/managed_agents/discovery/tests.rs", 1336],
   // identity-import-keyring: the identity resolution state machine's behavioral
   // matrix (46 tests over FakeIdentityStore — probe × marker × file cells,
   // adoption / read-back-corruption / marker-failure arms, recovery-mode
@@ -478,7 +481,8 @@ const overrides = new Map([
   // relay from the harness-attached payload relayUrl (with effective-relay
   // fallback for older harnesses) instead of a required arg the frontend
   // wrapper never passed, which silently broke the session-config cache.
-  ["src-tauri/src/commands/agent_config.rs", 1050],
+  // +1 (1050 -> 1051): intel runtime free-text config surface field. Queued to split.
+  ["src-tauri/src/commands/agent_config.rs", 1051],
   // codex-install-auto-restart review-fixes: should_restart_after_install
   // takes pid_alive:bool (pure predicate, no OS-dependent call); 3 racy
   // cache tests replaced with 6 pure availability_drift predicate tests;
@@ -545,7 +549,10 @@ const overrides = new Map([
   // isRuntimeAutoSeededRef tracking for edit-mode seeding (Fizz shows models);
   // runtimeSupportsLlmProviderSelection guard on discovery provider (codex fix);
   // hideProviderIds computation for Databricks v1 gate. Queued to split.
-  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1035],
+  // +163 (1035 -> 1198): intel create-flow free-text gateway URL, agent id, and
+  // API key fields (provider_locked runtime). Load-bearing feature growth;
+  // queued to split with the rest of this list.
+  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1198],
 ]);
 
 await runFileSizeCheck({
