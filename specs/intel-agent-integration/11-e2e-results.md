@@ -10,5 +10,24 @@
 
 ## Iteration-9 CI gate
 
-**When:** 2026-07-25T01:15Z · branch `feat/intel-acp-adapter` @ `62cb06cd` (7 commits) · `just ci`  
-**Verdict: RED** — `fmt-check` PASS; `clippy` FAIL (2× `buzz-intel-agent`); remaining stages not run. Failures: (1) `clippy::items_after_test_module` in `crates/buzz-intel-agent/src/acp.rs:917` — production helpers after `mod tests`; (2) `clippy::sliced_string_as_bytes` in `crates/buzz-intel-agent/src/intel.rs:948` — use `&full.as_bytes()[w[0]..w[1]]`. Not trivial fmt; left unfixed per gate policy. **Not PR-ready until clippy is green.**
+**When:** 2026-07-25T01:48Z · branch `feat/intel-acp-adapter` · `just ci`  
+**Verdict: GREEN** — full gate pass after clippy fix commit `7f940957` (`7f9409577bf292f65e2d3a19d227357edc52bf42`).
+
+| Stage | Result |
+|---|---|
+| fmt-check | PASS |
+| clippy (workspace) | PASS |
+| desktop-check (biome + file-sizes + px-text + pubkey) | PASS |
+| desktop-tauri-fmt-check | PASS |
+| desktop-tauri-clippy | PASS |
+| web-check | PASS |
+| mobile-check (dart format + flutter analyze + file-sizes) | PASS |
+| test-unit (buzz-core/auth/db/conformance/push-gateway) | PASS |
+| desktop-test | PASS |
+| desktop-build | PASS |
+| desktop-tauri-check | PASS |
+| desktop-tauri-test (1616 passed) | PASS |
+| web-build | PASS |
+| mobile-test (541 passed) | PASS |
+
+Fixes applied: (1) move production helpers above `#[cfg(test)] mod tests` in `acp.rs`; (2) `&full.as_bytes()[w[0]..w[1]]` in `intel.rs`; (3) ratchet file-size overrides for intel create-flow growth; (4) biome `noUselessTernary` on e2eBridge `provider_locked`. **PR-ready (local gate).** Not pushed.
