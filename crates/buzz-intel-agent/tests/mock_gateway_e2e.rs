@@ -607,6 +607,51 @@ async fn e2e_turn_quota_refuses_without_calling_gateway() {
     h.shutdown().await;
 }
 
+#[tokio::test]
+async fn e2e_missing_channel_cannot_bypass_quota_with_new_acp_session() {
+    let (gateway, st) = spawn_gateway(Scenario::HappyMultiFrame).await;
+    let mut h = Harness::spawn_with_env(
+        &gateway,
+        &[
+            ("INTEL_MAX_TURNS_PER_WINDOW", "1"),
+            ("INTEL_QUOTA_WINDOW_SECS", "3600"),
+        ],
+    )
+    .await;
+    h.initialize().await;
+    let first_sid = h.session_new().await;
+    let second_sid = h.session_new().await;
+    let channel_less_prompt = "direct ACP prompt without Buzz channel metadata";
+
+    let (first, _) = h.prompt(&first_sid, channel_less_prompt).await;
+    assert_eq!(first, "end_turn", "first turn is within quota");
+    let messages_after_first = st.messages_hits.load(Ordering::SeqCst);
+    let sessions_after_first = st.sessions_created.load(Ordering::SeqCst);
+    assert_eq!(messages_after_first, 1, "first turn calls the gateway once");
+    assert_eq!(
+        sessions_after_first, 1,
+        "first turn creates one intel session"
+    );
+
+    let (second, _) = h.prompt(&second_sid, channel_less_prompt).await;
+    assert_eq!(
+        second, "refusal",
+        "a new ACP session must not reset the channel-less quota budget"
+    );
+    assert_eq!(
+        st.messages_hits.load(Ordering::SeqCst),
+        messages_after_first,
+        "the refused second turn must not send another gateway message"
+    );
+    assert_eq!(
+        st.sessions_created.load(Ordering::SeqCst),
+        sessions_after_first,
+        "the refused second turn must not create another intel session"
+    );
+
+    h.shutdown().await;
+}
+
 /// Setting the limit to 0 disables enforcement rather than blocking everything.
 #[tokio::test]
 async fn e2e_turn_quota_zero_is_disabled() {

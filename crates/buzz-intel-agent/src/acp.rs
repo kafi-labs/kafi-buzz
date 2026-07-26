@@ -959,17 +959,14 @@ fn quota_community(cfg: &Config) -> Option<String> {
 }
 
 /// Build the quota scope key for this turn.
-fn quota_scope_key(
-    cfg: &Config,
-    acp_session_id: &str,
-    parsed: &crate::prompt::ParsedPrompt,
-) -> String {
+fn quota_scope_key(cfg: &Config, parsed: &crate::prompt::ParsedPrompt) -> String {
     let community = quota_community(cfg);
-    let channel = parsed
-        .channel_id
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| format!("acp:{acp_session_id}"));
-    crate::quota::scope_key(community.as_deref(), Some(&channel), &cfg.agent)
+    let channel = parsed.channel_id.map(|c| c.to_string());
+    // Channel-less ACP traffic intentionally shares one stable `nochannel`
+    // budget per community+agent. One noisy direct-ACP client can exhaust it
+    // for the others, but a cost control must fail toward refusal rather than
+    // grant a fresh budget whenever a client creates a new ACP session.
+    crate::quota::scope_key(community.as_deref(), channel.as_deref(), &cfg.agent)
 }
 
 /// Enforce the per-scope turn quota.
@@ -987,7 +984,7 @@ async fn enforce_turn_quota(
         return None;
     }
 
-    let key = quota_scope_key(&app.cfg, acp_session_id, parsed);
+    let key = quota_scope_key(&app.cfg, parsed);
     let decision = {
         let mut quota = app.quota.lock().await;
         quota.check_and_record_at(&key, std::time::Instant::now())

@@ -37,12 +37,22 @@ All settings are env-first; CLI flags mirror them. Required: `INTEL_GATEWAY_URL`
 
 | Env | Default | Meaning |
 |---|---|---|
-| `INTEL_MAX_TURNS_PER_WINDOW` | `30` | Paid gateway turns allowed per window, per scope. **`0` disables the quota** (it does not mean "deny all"). |
+| `INTEL_MAX_TURNS_PER_WINDOW` | `30` | Admitted logical ACP turns per window, per scope. **`0` disables the quota** (it does not mean "deny all"). |
 | `INTEL_QUOTA_WINDOW_SECS` | `3600` | Window length. Fixed window: the first turn starts it, and it resets once the window elapses. |
 
 Scope is `{relay host}/{channel uuid}/{intel agent}` — one budget per channel per
-agent. When a prompt carries no channel the ACP session id is used instead, so a
-harness session cannot bypass the budget by omitting the channel.
+agent. All channel-less traffic for one relay host and agent shares a stable
+`nochannel` budget. One noisy direct-ACP client can therefore exhaust that budget
+for other channel-less clients; this is deliberate for a cost control, because
+reconnecting must not grant a fresh allowance.
+
+The quota bounds admitted logical ACP turns, not billable gateway operations.
+One admitted turn can drive multiple gateway attempts through the no-frame retry
+or session-gone recreation paths, so N admitted turns do not guarantee at most N
+gateway operations. An admitted turn that later fails (401, 429, 503, timeout,
+or cancellation after admission) still consumes its slot. This is deliberate:
+after a mid-stream failure the adapter cannot know that the model did no billable
+work.
 
 **This is enabled by default.** It bounds spend on a surface that previously had
 none: the relay rate-limits *protocol admission* (WS connects and EVENT ingest,
