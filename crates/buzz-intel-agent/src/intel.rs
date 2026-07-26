@@ -61,6 +61,8 @@ pub struct TurnStreamResult {
     pub stream_error: Option<(Option<String>, String)>,
     /// Whether any SSE data frame was received (for retry idempotency).
     pub received_frame: bool,
+    /// Whether the stream delivered a terminal Done or Error frame.
+    pub terminal_received: bool,
     /// Request id from response headers when available.
     pub request_id: Option<String>,
 }
@@ -378,6 +380,9 @@ where
         ));
     }
     let stop = frame.kind == FrameKind::Done || frame.kind == FrameKind::Error;
+    if stop {
+        result.terminal_received = true;
+    }
     on_frame(frame).await;
     stop
 }

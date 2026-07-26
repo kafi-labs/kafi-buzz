@@ -69,3 +69,11 @@ A silent stop would be indistinguishable from an outage.
 carry no token usage (`MESSAGE_EVENT_TYPE_*` has no usage field), so the adapter
 has no token count to meter. Adding it requires a gateway-side change to report
 usage; the turn counter is the honest bound available today.
+
+### Incomplete gateway responses
+
+A successful answer requires a terminal SSE frame and non-whitespace response
+text. If the stream closes without `Done`, any accumulated partial text is
+discarded. Missing terminal frames and empty completed answers produce a safe,
+owner-visible platform error (including the request id when available) instead
+of publishing a partial or silently ending the turn.

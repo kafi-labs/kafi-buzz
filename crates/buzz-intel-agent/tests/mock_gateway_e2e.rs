@@ -29,6 +29,12 @@ const TEST_SK: &str = "000000000000000000000000000000000000000000000000000000000
 enum Scenario {
     /// THINKING → TOOL_CALL → TOOL_RESULT → RESPONSE → event:done
     HappyMultiFrame,
+    /// RESPONSE followed by a clean body EOF, with no terminal event.
+    CleanEofAfterPartialResponse,
+    /// Empty RESPONSE followed by event:done.
+    DoneWithEmptyResponse,
+    /// Whitespace-only RESPONSE followed by event:done.
+    DoneWithWhitespaceResponse,
     /// POST messages → 401
     Unauthorized,
     /// First messages call → 409; after recreate → happy stream
@@ -99,6 +105,20 @@ fn error_sse() -> String {
         "data: {\"event_type\":\"MESSAGE_EVENT_TYPE_ERROR\",\"code\":\"TURN_FAILED\",\"message\":\"model exploded\"}\n\n",
     )
     .to_owned()
+}
+
+fn response_sse(text: &str, include_done: bool) -> String {
+    let mut body = format!(
+        "data: {}\n\n",
+        json!({
+            "event_type": "MESSAGE_EVENT_TYPE_RESPONSE",
+            "response": { "response": text },
+        })
+    );
+    if include_done {
+        body.push_str("event: done\n\n");
+    }
+    body
 }
 
 fn midturn_error_sse(code: &str, internal_message: &str) -> String {
@@ -198,6 +218,11 @@ async fn post_message(
             "midturn-401-rid",
             None,
         ),
+        Scenario::CleanEofAfterPartialResponse => {
+            sse_response(response_sse("PARTIAL-CFO-NUMBER-742", false))
+        }
+        Scenario::DoneWithEmptyResponse => sse_response(response_sse("", true)),
+        Scenario::DoneWithWhitespaceResponse => sse_response(response_sse(" \t  ", true)),
         Scenario::HappyMultiFrame => sse_response(happy_sse()),
     }
 }
@@ -482,6 +507,90 @@ async fn assert_midturn_gateway_failure(
 
     drop(relay_bodies);
     h.shutdown().await;
+}
+
+async fn assert_incomplete_answer_is_visible_error(
+    scenario: Scenario,
+    forbidden_answer_marker: Option<&str>,
+) {
+    let (gateway, st) = spawn_gateway(scenario).await;
+    let mut h = Harness::spawn_with_env(
+        &gateway,
+        &[
+            ("INTEL_SSE_IDLE_TIMEOUT_SECS", "2"),
+            ("INTEL_TURN_TIMEOUT_SECS", "5"),
+        ],
+    )
+    .await;
+    h.initialize().await;
+    let sid = h.session_new().await;
+
+    let (reason, updates) = tokio::time::timeout(
+        Duration::from_secs(6),
+        h.prompt(&sid, &harness_prompt_named()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{scenario:?} hung past the configured turn bound"));
+    assert_eq!(reason, "end_turn");
+
+    if let Some(marker) = forbidden_answer_marker {
+        assert!(
+            !updates.iter().any(|update| {
+                update
+                    .pointer("/params/update/content/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains(marker))
+            }),
+            "{scenario:?} exposed incomplete answer marker {marker:?} in ACP updates: {updates:?}"
+        );
+    }
+
+    assert_eq!(
+        st.relay_posts.load(Ordering::SeqCst),
+        1,
+        "{scenario:?} must post exactly one owner-visible error"
+    );
+    let relay_bodies = st.relay_bodies.lock().await;
+    let owner_text = relay_bodies
+        .iter()
+        .find_map(|body| body.get("content").and_then(Value::as_str))
+        .unwrap_or_else(|| panic!("{scenario:?} relay post had no event content"));
+    assert!(
+        owner_text.starts_with("⚠️ Intel platform error"),
+        "{scenario:?} owner-visible message was not a safe platform error: {owner_text:?}"
+    );
+    assert!(
+        owner_text.contains("test-rid"),
+        "{scenario:?} lost gateway request id: {owner_text:?}"
+    );
+    if let Some(marker) = forbidden_answer_marker {
+        assert!(
+            !owner_text.contains(marker),
+            "{scenario:?} published incomplete answer marker {marker:?}: {owner_text:?}"
+        );
+    }
+
+    drop(relay_bodies);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn e2e_clean_eof_without_terminal_does_not_publish_partial_response() {
+    assert_incomplete_answer_is_visible_error(
+        Scenario::CleanEofAfterPartialResponse,
+        Some("PARTIAL-CFO-NUMBER-742"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn e2e_done_with_empty_or_whitespace_response_posts_safe_error() {
+    for scenario in [
+        Scenario::DoneWithEmptyResponse,
+        Scenario::DoneWithWhitespaceResponse,
+    ] {
+        assert_incomplete_answer_is_visible_error(scenario, None).await;
+    }
 }
 
 #[tokio::test]

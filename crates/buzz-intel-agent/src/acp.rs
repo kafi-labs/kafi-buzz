@@ -735,6 +735,27 @@ async fn ensure_and_run(
         return Err(AdapterError::Cancelled);
     }
 
+    if !stream.terminal_received {
+        tracing::error!(
+            request_id = ?stream.request_id,
+            "intel SSE ended without a terminal frame; discarding incomplete response"
+        );
+        if app.cfg.error_replies {
+            // This unattended agent can answer money-adjacent questions. A partial
+            // number presented as complete is more dangerous than a visible error.
+            let _ = post_error_reply(
+                app,
+                parsed.channel_id,
+                parsed.reply_to_event_id.as_deref(),
+                &owner_visible_error("incomplete response", stream.request_id.as_deref()),
+                epoch,
+                acp_session_id,
+            )
+            .await;
+        }
+        return Ok("end_turn".into());
+    }
+
     if let Some((code, msg)) = stream.stream_error {
         tracing::error!(
             code = ?code,
@@ -774,44 +795,62 @@ async fn ensure_and_run(
         let _ = state.touch_session(mapping_key, mark || already_forwarded || is_new);
     }
 
-    if !reply_text.is_empty() {
-        if let Some(channel) = parsed.channel_id {
-            if let Some(ref relay) = app.relay {
-                if epoch_is_current(app, acp_session_id, epoch).await {
-                    match relay
-                        .post_message(channel, &reply_text, parsed.reply_to_event_id.as_deref())
-                        .await
-                    {
-                        Ok(Some(eid)) => {
-                            tracing::info!(event_id = %eid, "posted reply to buzz");
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::error!("failed to post reply: {e}");
-                        }
-                    }
-                }
-            } else {
-                tracing::warn!("no relay publisher; skipping buzz reply post");
-            }
-        } else {
-            tracing::warn!("no channel_id in prompt; skipping buzz reply post");
-        }
-
-        // Final agent_message_chunk for desktop transcript coherence.
-        if epoch_is_current(app, acp_session_id, epoch).await {
-            wire::send(
-                wire_tx,
-                wire::session_update(
-                    acp_session_id,
-                    json!({
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": { "type": "text", "text": reply_text }
-                    }),
-                ),
+    if reply_text.is_empty() {
+        tracing::error!(
+            request_id = ?stream.request_id,
+            "intel SSE completed without a non-empty response"
+        );
+        if app.cfg.error_replies {
+            // Do not make an unattended empty answer look like a successful turn.
+            let _ = post_error_reply(
+                app,
+                parsed.channel_id,
+                parsed.reply_to_event_id.as_deref(),
+                &owner_visible_error("empty response", stream.request_id.as_deref()),
+                epoch,
+                acp_session_id,
             )
             .await;
         }
+        return Ok("end_turn".into());
+    }
+
+    if let Some(channel) = parsed.channel_id {
+        if let Some(ref relay) = app.relay {
+            if epoch_is_current(app, acp_session_id, epoch).await {
+                match relay
+                    .post_message(channel, &reply_text, parsed.reply_to_event_id.as_deref())
+                    .await
+                {
+                    Ok(Some(eid)) => {
+                        tracing::info!(event_id = %eid, "posted reply to buzz");
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!("failed to post reply: {e}");
+                    }
+                }
+            }
+        } else {
+            tracing::warn!("no relay publisher; skipping buzz reply post");
+        }
+    } else {
+        tracing::warn!("no channel_id in prompt; skipping buzz reply post");
+    }
+
+    // Final agent_message_chunk for desktop transcript coherence.
+    if epoch_is_current(app, acp_session_id, epoch).await {
+        wire::send(
+            wire_tx,
+            wire::session_update(
+                acp_session_id,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": reply_text }
+                }),
+            ),
+        )
+        .await;
     }
 
     Ok("end_turn".into())
