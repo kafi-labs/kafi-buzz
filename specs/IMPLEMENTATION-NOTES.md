@@ -2907,3 +2907,60 @@ check.
 | 2 | No timeout or kill path on the roster helper (`intel_agent_roster.rs:98-113`) | A gateway that accepts and never finishes leaves a child alive holding the bearer in its env; retries accumulate them |
 | 3 | Successful stdout is unredacted | A hostile/mistyped gateway could reflect the key in an agent `name`; only matters with an untrusted gateway or PATH substitution |
 | 4 | C3/C2 guarantees implemented but not pinned by tests | Real protection, unpinned contract |
+
+---
+
+**D-L101 — Hardened two latent leaks, and rejected a flaky test rather than shipping it.**
+
+Shipped as `39dad43d`.
+
+**The leak that was not yet a leak.** `Config`, `Cli` and `IntelClient` all derived `Debug` while
+holding secrets, and the crate contained **no** hand-written `Debug` impl. `Config` holds `api_key`
+**and** `private_key` — the latter is the agent's Nostr identity, so exposure is *impersonation*, not
+merely spend. No `{:?}` call existed; the hazard was that the next person adding
+`tracing::debug!(?cfg)` while debugging creates a credential leak with no review signal that they
+did. Fixing a leak that has not happened yet is cheap; fixing one that has is not.
+
+Redaction is `.map(|_| "<redacted>")` on the `Option`, so `None` still prints `None` and a set secret
+prints `Some("<redacted>")` — preserving the one signal that matters when debugging auth ("was it set
+at all?") without the value. Redaction that destroys `Debug`'s usefulness gets deleted by the next
+person, so this mattered. It also redacted **`auth_tag`**, which I never listed: the NIP-OA owner
+attestation, equally sensitive. Fourth time a lane extended a brief correctly.
+
+**The bounded lookup.** A gateway that accepts a connection and never finishes previously left a child
+alive **holding the bearer token in its environment**, one per Retry. Now bounded by a named
+`INTEL_AGENT_ROSTER_TIMEOUT` (20s — generous for a small list call, far under any human patience
+threshold) with the child reaped, reusing the existing `connection` error rather than adding a code
+the frontend cannot render. Only manifest change was enabling tokio's **existing** `process` feature:
+no new crate, no version bump.
+
+**I rejected the first attempt's test, and that is the entry worth keeping.** It passed **3/3 in
+isolation** and **failed in the full suite** — it started a one-second timeout *before* the helper was
+scheduled, then read a pidfile that under ~1640 parallel tests did not exist yet.
+
+Green-in-isolation, red-in-CI is the worst shape a test can take. It is not merely unreliable: it
+**teaches the team to re-run instead of investigate**, and in a *security* change that means the next
+genuine failure is dismissed as "that flaky roster test again". A flaky security test is worse than no
+test, because it converts a signal into noise.
+
+I explicitly forbade the tempting fix — inflating the bound — which would mask the race, stay flaky on
+a busier machine, and slow the suite for everyone. The deterministic fix polls for a **valid numeric
+pid** rather than mere file existence (closing the open-before-write window, a subtlety past my brief),
+bounds readiness *separately* at 10s with a distinct message so "helper never started" cannot be
+confused with "lookup was not bounded", and only then starts the original one-second timeout.
+
+**Method note:** this was the first divergence between a lane's self-report and my verification in six
+dispatches — and it diverged *honestly*: a real flake it had almost certainly seen pass. The catch came
+from running the **unfiltered** suite. A single-test run is exactly what hid it, from both of us.
+Two consecutive full runs are now the standard for anything timing-dependent.
+
+Verified by me: two consecutive unfiltered desktop suites at **1627 passed / 0 failed**, **84**
+intel-agent tests (was 82), `pnpm check` exit 0, workspace clippy clean, fmt clean.
+
+**Remaining from the blindspot pass, both genuinely minor** — recorded so they are not rediscovered as
+mysteries:
+
+| Finding | Assessment |
+|---|---|
+| Successful stdout is unredacted, so a hostile or mistyped gateway could reflect the key in an agent `name` | Only reachable with an untrusted gateway URL or PATH substitution. Worth a test if the roster is ever fed from a less-trusted source |
+| The stale-response generation guard and the model-clearing-on-runtime-switch are real code but unpinned by tests | Protection exists; the contract is not locked. Cheap regression tests, no behaviour change |
