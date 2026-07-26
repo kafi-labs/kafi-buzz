@@ -2320,3 +2320,46 @@ warnings` clean, fmt clean, only `intel.rs` touched, and both
 identity (D-L78), quota persistence across restart, the scope-key double-budget question, and the
 `feat/intel-acp-adapter` fast-forward (D-L58). Three commits — `5a14f361`, `4c208459` and their notes
 — are held from deploy because wren cannot functionally verify them (D-L83).
+
+---
+
+**D-L85 — MERGE-READINESS CONFIRMED at workspace level, and the one failing test is upstream's.**
+
+D13 is the only reason I ran this. That note recorded that per-crate clippy **missed two real errors**
+which the full workspace `--all-targets` run caught, and that the branch was "NOT actually PR-ready"
+despite green per-crate gates. Since `5a14f361` and `4c208459` I had run only per-crate gates, so the
+branch was sitting in exactly that trap's blind spot.
+
+Results, exit codes captured directly rather than piped:
+
+| Check | Result |
+|---|---|
+| `cargo clippy --workspace --all-targets` | **exit 0, zero errors** |
+| `cargo fmt --all --check` | **exit 0** |
+| `cargo test --workspace --lib --bins` | **1871 passed, 1 failed** |
+
+**The single failure is not mine, and I proved that rather than asserting it.** The failing test is
+`buzz-relay`'s `api::mesh_demo::tests::demo_join_forwarded_arm_round_trips_echo`. Chain of evidence:
+
+1. `crates/buzz-relay/Cargo.toml` has **no dependency** on `buzz-intel-agent`, so my crate cannot
+   affect it.
+2. It fails **deterministically**, 3/3 runs at ~10.4s each — a timeout, not a flake.
+3. `git diff --name-only <merge-base> HEAD -- crates/buzz-relay/` is **empty**: this branch never
+   touched the relay crate.
+4. The branch *does* modify `Cargo.lock`/`Cargo.toml` (it adds `buzz-intel-agent` to the workspace),
+   which could in principle bump a shared dependency — so inference alone was not enough.
+5. **Decisive:** I created a detached worktree at merge-base `9cc9652c` and ran that exact test there.
+   It failed identically — exit 101, same ~10.2s, same single failure.
+
+So it is pre-existing breakage inherited from `block/buzz` main, last touched by upstream `ccb021d7`
+("Relay mesh: cross-pod tunnel + huddle transport (#1670)"). The probe worktree was removed
+immediately afterwards; `git worktree list` is back to the expected four.
+
+**Why step 5 mattered even though steps 1–4 already pointed one way.** Steps 1–4 are a strong
+argument; step 5 is a measurement. Every time this loop substituted a confident argument for a
+measurement — the determinism claim (D-L81), the "on-VM `buzz` CLI" premise (D-L79), readiness
+standing in for usability (D-L78) — the argument was wrong. Running the test at the merge-base cost
+about ten minutes and converts "almost certainly upstream" into "upstream, demonstrated."
+
+**Status of the branch:** genuinely merge-ready at workspace level, with one inherited upstream
+failure that the user should know exists but which this branch neither caused nor can fix.
