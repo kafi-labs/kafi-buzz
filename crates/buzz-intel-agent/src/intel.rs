@@ -387,8 +387,12 @@ where
     stop
 }
 
-/// Hard cap on buffered SSE bytes (incomplete line + accumulated data lines).
-/// Mirrors the ACP NDJSON max line size to bound memory under adversarial streams.
+/// Hard cap on accounted SSE memory: incomplete line bytes, retained data
+/// contents, and one [`String`] metadata slot per retained data line.
+///
+/// This includes the dominant per-line overhead; allocator bookkeeping and
+/// unused `Vec` capacity are not counted. The cap mirrors the ACP NDJSON max
+/// line size to bound memory under adversarial streams.
 pub const SSE_BUFFER_CAP: usize = 8 * 1024 * 1024;
 
 /// Incremental SSE parser that tolerates frames split across arbitrary **byte** chunks.
@@ -400,7 +404,7 @@ pub const SSE_BUFFER_CAP: usize = 8 * 1024 * 1024;
 pub struct SseByteParser {
     buf: Vec<u8>,
     data_lines: Vec<String>,
-    /// Running total of bytes held in `data_lines` (for the size cap).
+    /// Retained data content plus `size_of::<String>()` per line.
     data_bytes: usize,
     event_name: Option<String>,
 }
@@ -474,7 +478,7 @@ impl SseByteParser {
             } else if let Some(rest) = line.strip_prefix("data:") {
                 // Spec: single space after colon is conventional; strip one.
                 let data = rest.strip_prefix(' ').unwrap_or(rest);
-                let add = data.len();
+                let add = data.len().saturating_add(std::mem::size_of::<String>());
                 if self.data_bytes.saturating_add(add) > SSE_BUFFER_CAP {
                     return Err(AdapterError::Intel(format!(
                         "sse data_lines exceeded {SSE_BUFFER_CAP} bytes (possible runaway stream)"
@@ -1012,6 +1016,28 @@ mod tests {
         assert!(
             msg.contains("sse buffer exceeded") || msg.contains("runaway"),
             "unexpected err: {msg}"
+        );
+    }
+
+    #[test]
+    fn sse_buffer_cap_counts_per_line_overhead() {
+        let mut p = SseByteParser::new();
+        let retained_per_line = 1 + std::mem::size_of::<String>();
+        let attempts = SSE_BUFFER_CAP / retained_per_line + 1;
+        let mut error = None;
+
+        for _ in 0..attempts {
+            if let Err(err) = p.push(b"data: x\n") {
+                error = Some(err);
+                break;
+            }
+        }
+
+        let err = error.expect("per-line metadata must count toward the SSE buffer cap");
+        assert!(
+            err.to_string().contains("sse buffer exceeded")
+                || err.to_string().contains("sse data_lines exceeded"),
+            "unexpected err: {err}"
         );
     }
 

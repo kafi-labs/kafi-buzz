@@ -116,6 +116,11 @@ impl TurnQuota {
             };
         };
 
+        // Admission pays an O(n) scan over tracked scopes. The map is bounded by
+        // active community/channel/agent scopes, and a large map is exactly when
+        // reclaiming elapsed scopes is worth the scan and immediately shrinks n.
+        self.evict_expired_at(now);
+
         let window = self.cfg.window;
         let entry = self.windows.entry(key.to_owned()).or_insert(Window {
             started_at: now,
@@ -342,6 +347,25 @@ mod tests {
 
         q.evict_expired_at(t0 + Duration::from_secs(61));
         assert_eq!(q.tracked_scopes(), 0);
+    }
+
+    #[test]
+    fn enforcement_evicts_expired_scopes_via_check_and_record() {
+        let mut q = TurnQuota::new(cfg(5, 60));
+        let t0 = Instant::now();
+        q.check_and_record_at("expired-a", t0);
+        q.check_and_record_at("expired-b", t0);
+        assert_eq!(q.tracked_scopes(), 2);
+
+        assert!(matches!(
+            q.check_and_record_at("current", t0 + Duration::from_secs(61)),
+            QuotaDecision::Allow { .. }
+        ));
+        assert_eq!(
+            q.tracked_scopes(),
+            1,
+            "normal enforcement must evict elapsed scopes before adding the current one"
+        );
     }
 
     #[test]
