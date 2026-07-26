@@ -2106,3 +2106,49 @@ end to end again either way, which is the third from-scratch validation of that 
 answer is either `391` or it is wrong, with no room for a confidently vague reply to pass. A second
 turn asks an Indonesian question containing an emoji, to exercise the multi-byte path against the
 live gateway rather than only against `sse_multibyte_split_mid_codepoint_is_lossless`.
+
+---
+
+**D-L81 — CORRECTION: D-L76 was wrong. The build is NOT byte-reproducible, and I called that claim
+"load-bearing" when it never was.**
+
+Building all four binaries at `19d74ec3` produced different bytes from the `b4978c05` build:
+
+| Binary | at `b4978c05` | at `19d74ec3` |
+|---|---|---|
+| `buzz-acp` | `97ecf541…` | `5b7d298c…` |
+| `buzz-intel-agent` | `889da100…` | `750f9cf0…` |
+
+But the compiled source is **identical**. `git diff --name-only b4978c05 19d74ec3` returns exactly
+two files: `crates/buzz-intel-agent/tests/mock_gateway_e2e.rs` (an integration-test target, not
+linked into the release binary) and `specs/IMPLEMENTATION-NOTES.md`. Neither crate has a `build.rs`,
+so no git SHA is embedded. The differing bytes are almost certainly rustc embedding absolute source
+paths, which vary per throwaway VM.
+
+**So the `buzz-acp` match in D-L76 was a coincidence** — those two VMs happened to use the same
+source path — and I generalised a sample of one into a property of the build system.
+
+**Two consequences, stated precisely, because one of my conclusions survives and one does not.**
+
+1. **The verification I actually rely on is unaffected.** I compare `sha256(file on the VM)` against
+   `sha256(the artifact file I built and still hold locally)`. That is a byte-for-byte *transfer*
+   check on one specific file. It proves "what is running is the file I built" and needs no
+   determinism whatsoever. All deploy verifications in this log remain sound.
+
+2. **The reasoning I gave for "no redeploy needed after `e9b16945`" was wrong, though the
+   conclusion was right.** I justified it with byte-determinism. The correct justification is
+   **source equality**: only a test target and docs changed, so the release binary's inputs are
+   unchanged and the running binary is still the right code. Right answer, wrong reason — recorded
+   because anyone relying on the reason I published would be misled.
+
+**Where D-L76 got the logic backwards.** I wrote that determinism "is what makes sha comparison
+evidence instead of luck." That is inverted. Comparing a *transferred file* to *the local original*
+is evidence on its own. Determinism would only matter if I were comparing a **rebuild** against a
+deployed binary — a check I have never performed and now know would fail spuriously. Had I later
+tried to verify a deployment by rebuilding and comparing, D-L76 would have sent me hunting a
+nonexistent tampering bug.
+
+**Rule going forward:** verify deployments by comparing the deployed file to *the retained build
+artifact*, never by rebuilding. And when a property is inferred from a single observation, label it
+as one observation — "these two builds matched" is a data point; "the build is deterministic" is a
+claim requiring a controlled test I did not run.
