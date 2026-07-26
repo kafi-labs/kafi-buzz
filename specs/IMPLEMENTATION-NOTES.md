@@ -1920,3 +1920,49 @@ former and implied the latter. Requiring the journal in the brief is what closed
 
 **Two consecutive deploys have now left `120`/`3600` intact.** The D-L52 incident mechanism is no
 longer an untested intention.
+
+---
+
+**D-L77 — The root-cause fix subsumed the fourth symptom, and that is now proven rather than
+argued.**
+
+D-L72 claimed the three silent-success defects shared one missing concept and that naming it
+"predicts where the fourth will be." The fourth was the `200`-with-non-SSE-body case (a proxy
+interstitial or auth wall — realistic here, since `intel-platform.exe.xyz` answers `307`, so
+redirects sit in the path). I traced it and concluded `5f6c21ee` had already closed it:
+
+1. the response content-type is never validated (`CONTENT_TYPE` in `intel.rs` appears only as an
+   import and when setting the **request** header at `intel.rs:106`);
+2. so an HTML body reaches the SSE parser and dispatches no frames;
+3. `send_message_stream` returns **`Ok`** — the *read* succeeded, there were simply no frames;
+4. the no-frame retry (`acp.rs:708-724`) is guarded on `Err(e) if first_try && !received_any_frame`,
+   so it never fires for an `Ok`;
+5. `terminal_received == false` routes the turn to the safe incomplete-response path.
+
+**I had reasoned this, not proven it**, so the dispatch asked for a regression test and explicitly
+said a *failing* test would be the more valuable result — it would mean a live silent-success path
+still existed and my analysis was wrong. The test
+(`e2e_200_non_sse_body_is_safe_failure_not_silent_success`) **passed first try against unchanged
+production code**, and the diff touches only `tests/mock_gateway_e2e.rs` — zero `src/` change,
+which is itself the evidence that no fix was required.
+
+The test also pins a property I care about beyond the control flow: the mock's HTML body carries
+conspicuous internal and fake-key markers, and the test asserts **none of them appear** in either
+the ACP message or the channel post. So "safe failure" is pinned as *safe*, not merely as
+*failure*.
+
+Verified by me: 61 unit + **14 e2e** pass (was 13), clippy `--all-targets -D warnings` clean, fmt
+clean, exit codes captured directly rather than piped.
+
+**Two things worth keeping from this.**
+
+First, on method: fixing the *concept* rather than each *symptom* meant the fourth case was closed
+before anyone looked at it. Had I patched three individual code paths, this one would still be live
+and would have needed its own discovery, its own fix, and its own deploy. The generalisation is
+cheap to state and expensive to relearn: **when several defects rhyme, find the missing distinction
+before writing the third patch.**
+
+Second, on honesty: the worker reported plainly that a first-try pass is a regression guard and
+"not a bug fix or a new production discovery." That framing was requested, and it matters — a
+green test here is easy to present as a catch. The silent-success family is now fixed and pinned at
+four cases; claiming a fifth would be inventing work.

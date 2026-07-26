@@ -35,6 +35,8 @@ enum Scenario {
     DoneWithEmptyResponse,
     /// Whitespace-only RESPONSE followed by event:done.
     DoneWithWhitespaceResponse,
+    /// HTTP 200 proxy/auth interstitial that is not an SSE stream.
+    NonSseHtmlOk,
     /// POST messages → 401
     Unauthorized,
     /// First messages call → 409; after recreate → happy stream
@@ -223,6 +225,15 @@ async fn post_message(
         }
         Scenario::DoneWithEmptyResponse => sse_response(response_sse("", true)),
         Scenario::DoneWithWhitespaceResponse => sse_response(response_sse(" \t  ", true)),
+        Scenario::NonSseHtmlOk => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header("x-request-id", "non-sse-rid")
+            .body(Body::from(
+                "<html><body>PROXY-INTERSTITIAL-INTERNAL \
+                 bearer=intel_FAKE_TEST_KEY_DO_NOT_LEAK</body></html>",
+            ))
+            .unwrap(),
         Scenario::HappyMultiFrame => sse_response(happy_sse()),
     }
 }
@@ -646,6 +657,80 @@ async fn e2e_channel_less_incomplete_response_notifies_acp_client() {
         "a channel-less prompt has no relay destination"
     );
 
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn e2e_200_non_sse_body_is_safe_failure_not_silent_success() {
+    let (gateway, st) = spawn_gateway(Scenario::NonSseHtmlOk).await;
+    let mut h = Harness::spawn_with_env(
+        &gateway,
+        &[
+            ("INTEL_SSE_IDLE_TIMEOUT_SECS", "2"),
+            ("INTEL_TURN_TIMEOUT_SECS", "5"),
+        ],
+    )
+    .await;
+    h.initialize().await;
+    let sid = h.session_new().await;
+
+    let (reason, updates) = tokio::time::timeout(
+        Duration::from_secs(6),
+        h.prompt(&sid, &harness_prompt_named()),
+    )
+    .await
+    .expect("HTTP 200 non-SSE turn hung past the configured bound");
+    assert_eq!(reason, "end_turn");
+    assert_eq!(
+        st.messages_hits.load(Ordering::SeqCst),
+        1,
+        "an Ok result with no frames must not enter the Err-only retry"
+    );
+
+    let safe_text = "⚠️ Intel platform error (incomplete response; request id: non-sse-rid)";
+    let acp_message_texts: Vec<&str> = updates
+        .iter()
+        .filter(|update| {
+            update
+                .pointer("/params/update/sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("agent_message_chunk")
+        })
+        .filter_map(|update| {
+            update
+                .pointer("/params/update/content/text")
+                .and_then(Value::as_str)
+        })
+        .collect();
+    assert_eq!(
+        acp_message_texts,
+        vec![safe_text],
+        "ACP must receive only the safe incomplete-response error"
+    );
+
+    assert_eq!(
+        st.relay_posts.load(Ordering::SeqCst),
+        1,
+        "channel must receive exactly one safe owner-visible error"
+    );
+    let relay_bodies = st.relay_bodies.lock().await;
+    let relay_texts: Vec<&str> = relay_bodies
+        .iter()
+        .filter_map(|body| body.get("content").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        relay_texts,
+        vec![safe_text],
+        "relay must receive only the safe incomplete-response error"
+    );
+
+    for text in acp_message_texts.iter().chain(relay_texts.iter()) {
+        assert!(!text.contains("<html"));
+        assert!(!text.contains("PROXY-INTERSTITIAL-INTERNAL"));
+        assert!(!text.contains("intel_FAKE_TEST_KEY_DO_NOT_LEAK"));
+    }
+
+    drop(relay_bodies);
     h.shutdown().await;
 }
 
