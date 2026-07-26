@@ -2450,3 +2450,42 @@ console is, from this branch's perspective, unavailable.
 resolve on this branch. Either merge those spec directories onto the branch or treat this file as the
 sole surviving record. Given that this file *is* now committed and they are not, it is currently more
 durable than the specs it cites.
+
+---
+
+**D-L89 — Sizing the "web based" half, and correcting my own first estimate mid-assessment.**
+
+The original ask said *"web based"*. `web/` has no intelligence surface (D-L86). Before proposing
+work I looked at what already exists, and my first read was too optimistic — recorded here with the
+correction, because the optimistic version would have understated a plan.
+
+**What is genuinely there.** `web/src/shared/lib/` already contains `nostr-client.ts`,
+`nostr-signer.ts`, `nip98.ts`, `relay-url.ts`, `pubkey.ts`. Stack is React 19 + TanStack Router
+(virtual file routes, `web/src/app/routes.ts`) + Vite 8. Routes today: `/`, `/invite/$code`,
+`/repos*`. So relay connection, event signing and NIP-98 HTTP auth exist — a console page is not
+starting from zero.
+
+**The correction.** I wrote that this "materially lowers the cost," then checked the actual exports:
+`nostr-client.ts` exposes **only `queryEvents`** — a read path, with no publish function — and `web/`
+does not reference the intel kinds (30175 / 30177 / 30179) anywhere.
+
+So the honest split is:
+
+| Half | Status |
+|---|---|
+| **Reading** a gateway/agent catalog | feasible with existing primitives |
+| **Writing** configuration | needs a publish path that does not exist yet |
+
+"Not greenfield" is true of the read half only. I caught this by checking the exports instead of
+inferring capability from filenames — `nostr-client.ts` *sounds* like it can publish.
+
+**Why this is logged rather than silently corrected:** an estimate that travels one message before
+being fixed is harmless; the same estimate inside a dispatched brief becomes a false premise a worker
+then builds on. That is precisely how D-L79 happened (an on-VM `buzz` CLI I assumed from a script's
+intent). Catching it before the brief is the whole value.
+
+**Also confirming D-L88 from another angle:** the earlier iterations produced
+`web/src/features/intelligence/join.ts` and `web/src/shared/lib/author-pinned-query.ts`. Neither
+exists on this branch. They were written in the `web-client-intel-console-assessment` worktree and
+never merged — the same scattering as the specs. Work that is real, reviewed, and unreachable from
+the branch it belongs to is indistinguishable from work that was never done.
