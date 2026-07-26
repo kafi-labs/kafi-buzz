@@ -1799,3 +1799,76 @@ buffer cap not accounting for vector overhead.
 distinguish *"the model finished"* from *"the stream stopped producing."* Three different symptoms,
 one missing concept. That is worth more than the three individual fixes, because it predicts where
 the fourth will be.
+
+---
+
+**D-L73 — Both silent-success defects fixed (`5f6c21ee`), and the `acp.rs` diff is not what it
+looks like.**
+
+`TurnStreamResult` now carries `terminal_received`, set in `apply_frame` for **`Done` and `Error`
+alike** — which matters: a terminal `Error` must keep routing to the existing `stream_error`
+handling rather than being misread as "incomplete". On EOF without a terminal frame the
+accumulated text is **discarded** and a safe owner-visible `incomplete response` error is posted,
+`x-request-id` preserved. An empty/whitespace-only answer posts `empty response` instead of
+returning silent success. The already-correct "empty content creates no kind-9" behaviour
+(`chunk.rs:80-83`, `reply.rs:85-89`) is untouched.
+
+**The diff read +103/−32 in `acp.rs`, which I flagged as too large for the change — and it was
+mostly de-indentation.** The success path had been wrapped in `if !reply_text.is_empty() { … }`;
+the fix replaces that with an early return and shifts the block left one level. I compared the
+moved body line by line (`post_message`, both `warn` branches, the final `agent_message_chunk`)
+before accepting it. Worth noting as a review habit: *an alarming line count is a reason to read,
+not a reason to reject* — but it must actually be read, because "it's just reindentation" is also
+what a smuggled change looks like.
+
+TDD red proofs were genuine: exit 101 on both, with panics at the asserting lines.
+
+---
+
+**D-L74 — The fix was correct for the audience I specified and silent for the one I did not.**
+
+Reviewing my own shipped fix, I found `post_error_reply` returns early when there is no channel
+(`acp.rs:1164-1166`):
+
+```rust
+let Some(channel) = channel_id else { return Ok(()); };
+```
+
+So a **channel-less direct ACP client** — the desktop app, which registers `intel` as an ACP
+runtime — got no partial text *and no error*: a bare `end_turn` with nothing. For that client the
+fix had converted "dangerous truncated answer" into "silent empty turn."
+
+Safer, and still wrong. **A bare `end_turn` with no content is reporting success**, which is
+precisely what the change existed to eliminate. The defect was closed for the channel audience
+and left open for the ACP one.
+
+Fixed in `b4978c05`: `notify_incomplete_answer` builds the safe text **once** and delivers it to
+both audiences — an epoch-guarded ACP `session_update` (the same `agent_message_chunk` mechanism
+the success path already uses) plus the existing channel post when a channel exists. The rule is
+stated in a code comment rather than left implicit: the ACP transcript and the Buzz channel are
+separate audiences, and the desktop client cannot see the channel message, so ACP is always
+notified.
+
+**This is the third time in two iterations that the defect was in my brief, not the worker's
+output** (see D-L59, D-L74, and the D-L72 scoping). The pattern is consistent enough to name:
+**when I specify a fix, I specify the path I was thinking about, and the untouched sibling path
+inherits the bug.** Reviewing my own instruction alongside the diff — asking "which callers did I
+*not* mention?" — is what caught it both times. Verifying the worker's work is necessary but
+insufficient; the brief needs the same scrutiny.
+
+---
+
+**D-L75 — Why this deploy, unlike the last one, is not a no-op.**
+
+D-L68 justified deploying the quota fix despite it being unreachable in live traffic, on
+drift-avoidance grounds alone. **This one needs no such argument.** wren reaches
+`intel-platform.exe.xyz` across the public internet, where a mid-stream connection drop is
+ordinary rather than exotic — and until `5f6c21ee` that produced a truncated answer published as
+complete, indistinguishable from a real one. After deployment it produces a visible error.
+
+That is a genuine behavioural improvement to live, unattended, money-adjacent traffic, and it is
+the first change in this loop whose deployment is justified by user-visible correctness rather
+than by hygiene. The deploy brief is the same hardened one that worked at `6d1fbf82`, with the
+D-L52 mechanism intact (no `INTEL_*` edits anywhere, `run-harness.sh` named as the file whose
+`export` wins, restore-on-mismatch rather than repair) plus a new requirement to capture the
+startup journal, so a clean start is evidenced rather than assumed.
