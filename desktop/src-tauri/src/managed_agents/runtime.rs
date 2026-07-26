@@ -21,7 +21,10 @@ pub(crate) use path::should_skip_claude_executable;
 pub(crate) use path::should_use_inherited;
 
 mod metadata_env;
-pub(crate) use metadata_env::{apply_runtime_metadata_env, runtime_metadata_env_vars};
+pub(crate) use metadata_env::{
+    apply_runtime_metadata_env, apply_user_env_with_runtime_metadata_precedence,
+    retain_user_env_not_shadowing_runtime_metadata, runtime_metadata_env_vars,
+};
 
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
@@ -1977,15 +1980,22 @@ pub fn spawn_agent_child(
     // above — EXCEPT reserved keys (BUZZ_PRIVATE_KEY, NOSTR_PRIVATE_KEY,
     // BUZZ_AUTH_TAG, BUZZ_API_TOKEN, BUZZ_ACP_PRIVATE_KEY, BUZZ_ACP_API_TOKEN),
     // which `merged_user_env` strips. Those carry Buzz's identity and must
-    // never be GUI-overridable.
+    // never be GUI-overridable. Runtime-declared provider/model env keys are
+    // also skipped when their labeled structured field has an effective value;
+    // otherwise an invisible legacy env entry would silently defeat the UI.
     // global < live persona < agent (last-wins on collision at each layer).
     let persona_over_global = super::env_vars::merged_user_env(
         &global.env_vars,
         &super::env_vars::live_persona_env(&personas, record.persona_id.as_deref()),
     );
-    for (key, value) in super::env_vars::merged_user_env(&persona_over_global, &record.env_vars) {
-        command.env(key, value);
-    }
+    let user_env = super::env_vars::merged_user_env(&persona_over_global, &record.env_vars);
+    apply_user_env_with_runtime_metadata_precedence(
+        &mut command,
+        runtime_meta,
+        effective_model,
+        effective_provider,
+        &user_env,
+    );
     configure_runtime_cli(&mut command, runtime_meta);
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible

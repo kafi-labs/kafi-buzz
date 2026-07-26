@@ -122,16 +122,28 @@ pub(crate) fn resolve_effective_agent_env(
     // Injected before persona/agent so per-agent values win on collision.
     // `merged_user_env` with an empty "lower" map applies reserved/malformed-key
     // filtering to the global map for free.
-    let global_env = merged_user_env(&BTreeMap::new(), &global.env_vars);
+    let mut global_env = merged_user_env(&BTreeMap::new(), &global.env_vars);
+    super::runtime::retain_user_env_not_shadowing_runtime_metadata(
+        &mut global_env,
+        runtime,
+        effective_model,
+        effective_provider,
+    );
     env.extend(global_env);
 
     // Layer 3b: merged user env — live persona env under the record's own
     // overrides (last-wins), after reserved/malformed-key filtering. Reading
     // the persona live is what makes persona credential edits refresh on the
     // next spawn instead of being frozen into the record.
-    let user_env = merged_user_env(
+    let mut user_env = merged_user_env(
         &super::env_vars::live_persona_env(personas, record.persona_id.as_deref()),
         &record.env_vars,
+    );
+    super::runtime::retain_user_env_not_shadowing_runtime_metadata(
+        &mut user_env,
+        runtime,
+        effective_model,
+        effective_provider,
     );
     env.extend(user_env);
 

@@ -212,6 +212,7 @@ fn record_model_overrides_file_model() {
 fn provider_locked_shows_locked() {
     let record = test_record();
     let runtime = &KnownAcpRuntime {
+        provider_env_var: None,
         provider_locked: true,
         ..*test_runtime()
     };
@@ -219,6 +220,46 @@ fn provider_locked_shows_locked() {
     let provider = surface.normalized.provider.unwrap();
     assert_eq!(provider.value.as_deref(), Some("Anthropic (locked)"));
     assert_eq!(provider.origin, ConfigOrigin::HarnessConstraint);
+}
+
+#[test]
+fn intel_locked_provider_shows_structured_gateway_and_ignores_legacy_env() {
+    let mut record = test_record();
+    record.provider = Some("https://labeled.example.test".to_string());
+    record.env_vars.insert(
+        "INTEL_GATEWAY_URL".to_string(),
+        "https://legacy.example.test".to_string(),
+    );
+    let runtime = &KnownAcpRuntime {
+        id: "intel",
+        label: "Intelligence Platform",
+        commands: &["buzz-intel-agent"],
+        model_env_var: Some("INTEL_AGENT"),
+        provider_env_var: Some("INTEL_GATEWAY_URL"),
+        provider_locked: true,
+        inject_provider_env: true,
+        required_normalized_fields: &["model", "provider"],
+        ..*test_runtime()
+    };
+
+    let surface = read_config_surface(&record, Some(runtime), None, None);
+    let provider = surface
+        .normalized
+        .provider
+        .expect("Intel provider field must be visible");
+
+    assert_eq!(
+        provider.value.as_deref(),
+        Some("https://labeled.example.test")
+    );
+    assert_ne!(provider.value.as_deref(), Some("Anthropic (locked)"));
+    assert_eq!(provider.origin, ConfigOrigin::BuzzExplicit);
+    assert_eq!(
+        provider.write_via,
+        ConfigWriteMechanism::RespawnWithEnvVar {
+            env_key: "INTEL_GATEWAY_URL".to_string(),
+        }
+    );
 }
 
 #[test]

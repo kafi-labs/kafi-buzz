@@ -29,11 +29,12 @@ pub(crate) fn read_config_surface(
 
     // Tier 2a: record-level values (Buzz-explicit).
     let record_model = record.model.clone();
-    let record_provider = record
-        .env_vars
-        .get(runtime_meta.and_then(|m| m.provider_env_var).unwrap_or(""))
-        .cloned()
-        .or_else(|| record.provider.clone()); // structured provider field as fallback
+    let record_provider = record.provider.clone().or_else(|| {
+        record
+            .env_vars
+            .get(runtime_meta.and_then(|m| m.provider_env_var).unwrap_or(""))
+            .cloned()
+    }); // legacy provider env remains a fallback when the structured field is absent
 
     let supports_acp_model = runtime_meta.is_some_and(|m| m.supports_acp_model_switching);
     let model_env_var = runtime_meta.and_then(|m| m.model_env_var);
@@ -363,7 +364,7 @@ fn build_provider_field(
     provider_locked: bool,
     is_required: bool,
 ) -> Option<NormalizedField> {
-    if provider_locked {
+    if provider_locked && provider_env_var.is_none() {
         return Some(NormalizedField {
             value: Some("Anthropic (locked)".to_string()),
             origin: ConfigOrigin::HarnessConstraint,
