@@ -2738,3 +2738,58 @@ D-L74, D-L79, plus the D-L93 gate I skipped); the lanes caught traps my briefs m
 clash). Worth stating plainly: **the executors have been more reliable than the instructions.** The
 mechanism that helped most was not tighter instructions but *checkable* ones — every brief that
 stated a verifiable acceptance predicate got either a correct result or an honest refusal.
+
+---
+
+**D-L98 — Global defaults rendered the wrong form entirely, and I declined to add the picker there.**
+
+Shipped as `15007a69`. Two things, one of which is a decision not to build.
+
+**The defect.** With Intel selected in global Agent defaults, `AgentConfigFields` rendered a generic
+LLM "Provider" dropdown (`:652-742`), an API key derived from the *provider catalog* rather than the
+runtime's `apiKeyEnvVar` (`:327-353`, `:744-771`), and a generic model field (`:773-820`). None of
+those correspond to Intel's actual configuration.
+
+What makes this notable is that **the shared field-model layer already computed the right answer** —
+`provider_locked + providerEnvVar` = free-text gateway, `provider_locked + modelEnvVar` = agent name,
+`apiKeyEnvVar` = runtime-owned secret (`agentConfigCore.ts:137-164`, `212-268`) — and
+`agentConfigCore.test.mjs:159-210` already pinned Gateway URL / Agent name / `INTEL_AGENT` /
+`INTEL_API_KEY`. The renderer ignored what it was told. A passing test asserted the correct
+descriptors while the UI showed different fields: the *seventh* instance of this log's dominant
+pattern, and the first where the correct behaviour was already under test.
+
+**The ID cleanup, which is mine to own.** `RuntimeAgentNameField` hardcoded `persona-runtime-*`
+DOM/test IDs. Harmless with one instance — but `0088babe` added a second, so duplicate IDs became a
+live risk *because of my own change*, and the persona naming became actively misleading in a
+non-persona dialog. Now an optional `idPrefix` defaulting to the original value, with named constants
+per call site (`persona-runtime`, `edit-agent-runtime`). Shipping a second instance of a component
+with hardcoded IDs is a small thing that only becomes a bug on the second use — worth remembering
+when reusing anything that names DOM nodes.
+
+**The decision NOT to build: no roster picker on global defaults.**
+
+B3 established that `GlobalAgentConfig` is **not keyed per runtime**. Its values apply at the lowest
+precedence layer to *all* agents (`types.ts:1014-1030`), and spawn maps the effective model into the
+runtime's `model_env_var` (`runtime.rs:1880-1905`, `metadata_env.rs:9-25`). So a value chosen as an
+Intel agent slug is inherited by any runtime lacking a closer override — `buzz-e2e-assistant` could
+land on a Claude-backed agent as its "model".
+
+Rendering the correct *fields* there is an unambiguous defect fix. Adding a *picker* would make it
+materially easier to set a cross-runtime footgun, which is a **product decision about global-default
+semantics**, not a repair. After many iterations of choosing my own work, this is one where the
+distinction actually bites: the code change would be easy and the consequence is a design commitment.
+Free-text per the descriptor is the right behaviour until someone decides whether global defaults
+should be runtime-scoped at all.
+
+**Guarded explicitly, because `AgentConfigFields` is shared:** non-Intel runtimes stay on the existing
+LLM-catalog path with a dedicated regression test, and onboarding bypasses the new branch entirely
+(B2 #4 showed Intel is not reachable there, so a picker would be dead code).
+
+Verified by me: `pnpm check` exit 0, **3490** JS tests (was 3486) with 0 failures, **1626** desktop
+Rust tests, clippy `--all-targets -D warnings` clean, fmt clean, only `desktop/**` touched, and the
+boundary confirmed by `grep -c RuntimeAgentNameField AgentConfigFields.tsx` → **0**.
+
+**Desktop side of the original ask is now complete:** configure gateway/key, select an agent when
+creating, select when editing, and correct fields in global defaults. Remaining from the original
+request: the **web** console, which is a real build rather than wiring — `web/` has relay and signing
+primitives but no publish path (D-L89).
