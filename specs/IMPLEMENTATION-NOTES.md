@@ -1660,3 +1660,41 @@ requires proving `120`/`3600` from `/proc/<pid>/environ` after the restart — w
 that a mismatch means *restore the backups and report the failure*, explicitly **not** "edit the
 config until it matches." Last time the failure was a worker changing a value and not restoring
 it; the fix is to make restoration the required response to a mismatch rather than repair.
+
+---
+
+**D-L69 — DEPLOY VERIFIED, and the incident did not repeat.**
+
+`6d1fbf82` is live on wren. Every line below I confirmed myself against the host, not from the
+worker's report.
+
+| Check | Result |
+|---|---|
+| Process | PID `2709580` (was `2494038`), `ActiveState=active`, `NRestarts=0` |
+| **Quota env, from `/proc/2709580/environ`** | **`INTEL_MAX_TURNS_PER_WINDOW=120`, `INTEL_QUOTA_WINDOW_SECS=3600`** |
+| `buzz-intel-agent` sha256 | built `0de75183…` → deployed `0de75183…` ✅ |
+| `buzz-acp` sha256 | built `97ecf541…` → deployed `97ecf541…` ✅ |
+| Both binaries | `ELF 64-bit x86-64` (native build, not emulated) |
+| Previous binary | `69c13560…` preserved as timestamped `.bak` |
+| Throwaway build VM | created (49→50), torn down (50→**49**) |
+| Relay / gateway | `200` / `307` |
+
+**The headline is the second row.** The D-L52 incident was a worker lowering the live quota and
+never restoring it; this deploy touched a live production agent and the values came back exactly
+right. The mechanism — forbid all `INTEL_*` edits, name `run-harness.sh` as the one whose
+`export` wins, and require restore-on-mismatch — held on its first real test.
+
+**Chain of custody was checkable end to end**, which is the part worth keeping: the sha I built
+locally, the sha on disk on the VM, and the sha the process is running all agree. "Deployed"
+became a verifiable claim rather than a report.
+
+**Drift check afterwards: 2 findings, 0 errors — both expected.** The two relay containers run
+upstream `ghcr.io/block/buzz:main` (`50fadaa7`, `b78a684c`) while local HEAD is this branch. That
+is the intended state: this branch is intel-agent work and does not build the relay. No drift was
+reported on the binaries just deployed.
+
+**Small accuracy note on my own method:** I read `DRIFT_EXIT=0` from a pipeline whose last stage
+was `tail`, so that was `tail`'s status, not the script's. The `SUMMARY:` line is the authoritative
+signal. Same shape of error as D-L61 — the check that *looks* like it confirms something while
+actually measuring the wrong thing. Two occurrences in one session is a pattern, not bad luck:
+**when a command's exit status is the evidence, do not pipe it.**
