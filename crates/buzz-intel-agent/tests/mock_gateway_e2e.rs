@@ -35,6 +35,12 @@ enum Scenario {
     ConflictThenOk,
     /// SSE ERROR frame mid-stream
     SseError,
+    /// THINKING + TOOL_CALL, then a rate-limit error signal.
+    MidTurnTooManyRequests,
+    /// THINKING + TOOL_CALL, then an upstream-unavailable error signal.
+    MidTurnServiceUnavailable,
+    /// THINKING + TOOL_CALL, then a credentials-revoked error signal.
+    MidTurnUnauthorized,
 }
 
 #[derive(Clone)]
@@ -45,6 +51,7 @@ struct MockState {
     /// session_id → message attempt count for that id
     per_session_msgs: Arc<Mutex<std::collections::HashMap<String, usize>>>,
     relay_posts: Arc<AtomicUsize>,
+    relay_bodies: Arc<Mutex<Vec<Value>>>,
 }
 
 impl MockState {
@@ -55,6 +62,7 @@ impl MockState {
             messages_hits: Arc::new(AtomicUsize::new(0)),
             per_session_msgs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             relay_posts: Arc::new(AtomicUsize::new(0)),
+            relay_bodies: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -93,12 +101,47 @@ fn error_sse() -> String {
     .to_owned()
 }
 
+fn midturn_error_sse(code: &str, internal_message: &str) -> String {
+    format!(
+        concat!(
+            "data: {{\"event_type\":\"MESSAGE_EVENT_TYPE_THINKING\"}}\n\n",
+            "data: {{\"event_type\":\"MESSAGE_EVENT_TYPE_TOOL_CALL\",",
+            "\"id\":\"tc-before-failure\",\"title\":\"started-before-failure\"}}\n\n",
+            "data: {{\"event_type\":\"MESSAGE_EVENT_TYPE_ERROR\",",
+            "\"code\":{code},\"message\":{message}}}\n\n",
+        ),
+        code = serde_json::to_string(code).unwrap(),
+        message = serde_json::to_string(internal_message).unwrap(),
+    )
+}
+
 fn sse_response(body: String) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header("x-request-id", "test-rid")
         .body(Body::from(body))
+        .unwrap()
+}
+
+/// Once a 200 SSE response has begun, HTTP cannot send a second status line.
+/// The gateway's mid-turn status is therefore represented by its ERROR frame;
+/// response metadata such as Retry-After and x-request-id remains in headers.
+fn midturn_error_response(
+    status_code: &str,
+    internal_message: &str,
+    request_id: &str,
+    retry_after: Option<&str>,
+) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header("x-request-id", request_id);
+    if let Some(value) = retry_after {
+        builder = builder.header(header::RETRY_AFTER, value);
+    }
+    builder
+        .body(Body::from(midturn_error_sse(status_code, internal_message)))
         .unwrap()
 }
 
@@ -137,12 +180,31 @@ async fn post_message(
             }
         }
         Scenario::SseError => sse_response(error_sse()),
+        Scenario::MidTurnTooManyRequests => midturn_error_response(
+            "HTTP_429",
+            "rate limiter shard=private-red retry ledger internals",
+            "midturn-429-rid",
+            Some("17"),
+        ),
+        Scenario::MidTurnServiceUnavailable => midturn_error_response(
+            "HTTP_503",
+            "upstream pool=secret-blue stack=private-handler",
+            "midturn-503-rid",
+            None,
+        ),
+        Scenario::MidTurnUnauthorized => midturn_error_response(
+            "HTTP_401",
+            "credential fingerprint=private-fingerprint was revoked",
+            "midturn-401-rid",
+            None,
+        ),
         Scenario::HappyMultiFrame => sse_response(happy_sse()),
     }
 }
 
-async fn relay_events(State(st): State<MockState>) -> impl IntoResponse {
+async fn relay_events(State(st): State<MockState>, Json(body): Json<Value>) -> impl IntoResponse {
     st.relay_posts.fetch_add(1, Ordering::SeqCst);
+    st.relay_bodies.lock().await.push(body);
     (StatusCode::OK, Json(json!({"ok": true})))
 }
 
@@ -354,6 +416,74 @@ fn update_kinds(updates: &[Value]) -> Vec<String> {
         .collect()
 }
 
+async fn assert_midturn_gateway_failure(
+    scenario: Scenario,
+    expected_request_id: &str,
+    forbidden_gateway_details: &[&str],
+) {
+    let (gateway, st) = spawn_gateway(scenario).await;
+    let mut h = Harness::spawn_with_env(
+        &gateway,
+        &[
+            ("INTEL_SSE_IDLE_TIMEOUT_SECS", "2"),
+            ("INTEL_TURN_TIMEOUT_SECS", "5"),
+        ],
+    )
+    .await;
+    h.initialize().await;
+    let sid = h.session_new().await;
+
+    let (reason, updates) = tokio::time::timeout(
+        Duration::from_secs(6),
+        h.prompt(&sid, &harness_prompt_named()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{scenario:?} hung past the configured turn bound"));
+
+    assert_eq!(
+        reason, "end_turn",
+        "{scenario:?} should terminate the failed stream cleanly"
+    );
+
+    let kinds = update_kinds(&updates);
+    assert!(
+        kinds.iter().any(|kind| kind == "agent_thought_chunk"),
+        "{scenario:?} must deliver a frame before failing, got {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| kind == "tool_call"),
+        "{scenario:?} must fail after the stream has made progress, got {kinds:?}"
+    );
+
+    assert_eq!(
+        st.relay_posts.load(Ordering::SeqCst),
+        1,
+        "{scenario:?} must post exactly one owner-visible error"
+    );
+    let relay_bodies = st.relay_bodies.lock().await;
+    let owner_text = relay_bodies
+        .iter()
+        .find_map(|body| body.get("content").and_then(Value::as_str))
+        .unwrap_or_else(|| panic!("{scenario:?} relay post had no event content"));
+    assert!(
+        owner_text.starts_with("⚠️ Intel platform error"),
+        "{scenario:?} owner-visible message was not a safe platform error: {owner_text:?}"
+    );
+    assert!(
+        owner_text.contains(expected_request_id),
+        "{scenario:?} lost gateway request id {expected_request_id:?}: {owner_text:?}"
+    );
+    for forbidden in forbidden_gateway_details {
+        assert!(
+            !owner_text.contains(forbidden),
+            "{scenario:?} leaked gateway detail {forbidden:?}: {owner_text:?}"
+        );
+    }
+
+    drop(relay_bodies);
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn e2e_happy_path_multi_frame_and_one_session_per_channel() {
     let (gateway, st) = spawn_gateway(Scenario::HappyMultiFrame).await;
@@ -543,4 +673,34 @@ async fn e2e_sse_error_frame_end_turn() {
         "error reply should be posted"
     );
     h.shutdown().await;
+}
+
+#[tokio::test]
+async fn e2e_midturn_429_retry_after_posts_safe_owner_error() {
+    assert_midturn_gateway_failure(
+        Scenario::MidTurnTooManyRequests,
+        "midturn-429-rid",
+        &["private-red", "retry ledger", "shard="],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn e2e_midturn_503_after_frames_posts_safe_owner_error() {
+    assert_midturn_gateway_failure(
+        Scenario::MidTurnServiceUnavailable,
+        "midturn-503-rid",
+        &["secret-blue", "private-handler", "stack="],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn e2e_midturn_401_revoked_credentials_posts_safe_owner_error() {
+    assert_midturn_gateway_failure(
+        Scenario::MidTurnUnauthorized,
+        "midturn-401-rid",
+        &["private-fingerprint", "credential fingerprint", "revoked"],
+    )
+    .await;
 }
