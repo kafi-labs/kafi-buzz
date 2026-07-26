@@ -77,6 +77,7 @@ import { useBakedBuildEnvKeysQuery, useRuntimeFileConfigQuery } from "../hooks";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentHarnessField } from "./AgentHarnessField";
+import { RuntimeAgentNameField } from "./RuntimeAgentNameField";
 import {
   AgentAiConfigurationModeField,
   AgentCreateAiDefaultsSummary,
@@ -1048,40 +1049,26 @@ export function AgentDefinitionDialog({
               ) : null}
 
               {freeTextModelFieldVisible && freeTextModelField ? (
-                <div className="space-y-1.5">
-                  <RequiredFieldLabel
-                    htmlFor="persona-runtime-model-env"
-                    isRequired={
-                      freeTextModelField.required || isExplicitModelRequired
-                    }
-                  >
-                    {freeTextModelField.label}
-                  </RequiredFieldLabel>
-                  <div
-                    className={cn(
-                      "flex min-h-11 items-center px-3",
-                      PERSONA_FIELD_SHELL_CLASS,
-                    )}
-                  >
-                    <Input
-                      autoCorrect="off"
-                      className={cn(
-                        "h-8 px-0 py-0 leading-6",
-                        PERSONA_FIELD_CONTROL_CLASS,
-                      )}
-                      data-testid="persona-runtime-agent-name"
-                      disabled={isPending}
-                      id="persona-runtime-model-env"
-                      onChange={(event) => setModel(event.target.value)}
-                      placeholder={
-                        freeTextModelField.targetApplication.kind === "envVar"
-                          ? freeTextModelField.targetApplication.key
-                          : "Agent name"
-                      }
-                      value={model}
-                    />
-                  </div>
-                </div>
+                <RuntimeAgentNameField
+                  apiKey={
+                    runtimeApiKeyKey ? (envVars[runtimeApiKeyKey] ?? "") : ""
+                  }
+                  disabled={isPending}
+                  enabled={open && aiConfigurationMode === "custom"}
+                  gatewayUrl={provider}
+                  label={freeTextModelField.label}
+                  onValueChange={setModel}
+                  placeholder={
+                    freeTextModelField.targetApplication.kind === "envVar"
+                      ? freeTextModelField.targetApplication.key
+                      : "Agent name"
+                  }
+                  required={
+                    freeTextModelField.required || isExplicitModelRequired
+                  }
+                  runtimeId={selectedRuntime?.id ?? runtime}
+                  value={model}
+                />
               ) : null}
 
               <AnimatePresence initial={false}>

@@ -20,6 +20,9 @@ pub(crate) use path::compose_path_entries;
 pub(crate) use path::should_skip_claude_executable;
 pub(crate) use path::should_use_inherited;
 
+mod metadata_env;
+pub(crate) use metadata_env::{apply_runtime_metadata_env, runtime_metadata_env_vars};
+
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
 pub use stop::{stop_managed_agent_process, stop_managed_agent_workspace_pair};
@@ -2142,49 +2145,6 @@ pub fn start_managed_agent_process(
 
     runtimes.insert(key, ManagedAgentPairRuntime::starting(process));
     Ok(())
-}
-
-/// Returns the (key, value) env var pairs that should be forwarded to the
-/// agent process for model and provider selection.
-///
-/// Model injection is unconditional — even agents that support ACP model
-/// switching need the initial bootstrap value. Provider injection is controlled
-/// independently from the UI's provider-catalog lock.
-pub(crate) fn runtime_metadata_env_vars<'a>(
-    model_env_var: Option<&'a str>,
-    provider_env_var: Option<&'a str>,
-    inject_provider_env: bool,
-    effective_model: Option<&'a str>,
-    effective_provider: Option<&'a str>,
-) -> Vec<(&'a str, &'a str)> {
-    let mut vars = Vec::new();
-    if let (Some(env_key), Some(model)) = (model_env_var, effective_model) {
-        vars.push((env_key, model));
-    }
-    if inject_provider_env {
-        if let (Some(env_key), Some(provider)) = (provider_env_var, effective_provider) {
-            vars.push((env_key, provider));
-        }
-    }
-    vars
-}
-
-/// Applies runtime-specific model and provider metadata to the actual child command.
-pub(crate) fn apply_runtime_metadata_env(
-    command: &mut std::process::Command,
-    runtime: &KnownAcpRuntime,
-    effective_model: Option<&str>,
-    effective_provider: Option<&str>,
-) {
-    for (key, value) in runtime_metadata_env_vars(
-        runtime.model_env_var,
-        runtime.provider_env_var,
-        runtime.inject_provider_env,
-        effective_model,
-        effective_provider,
-    ) {
-        command.env(key, value);
-    }
 }
 
 /// Resolve the effective (prompt, model, provider) triple for a persona-linked agent.
