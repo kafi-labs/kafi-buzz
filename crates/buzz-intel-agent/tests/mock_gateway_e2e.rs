@@ -182,6 +182,11 @@ struct Harness {
 
 impl Harness {
     async fn spawn(gateway: &str) -> Self {
+        Self::spawn_with_env(gateway, &[]).await
+    }
+
+    /// Spawn with extra environment, for tests that need non-default config.
+    async fn spawn_with_env(gateway: &str, extra_env: &[(&str, &str)]) -> Self {
         let state_dir = TempDir::new().unwrap();
         let bin = env!("CARGO_BIN_EXE_buzz-intel-agent");
         let mut cmd = tokio::process::Command::new(bin);
@@ -202,6 +207,9 @@ impl Harness {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
         let mut child = cmd.spawn().expect("spawn buzz-intel-agent");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
@@ -422,6 +430,71 @@ async fn e2e_unauthorized_returns_refusal() {
     let (reason, _updates) = h.prompt(&sid, &harness_prompt_named()).await;
     assert_eq!(reason, "refusal");
     assert_eq!(st.sessions_created.load(Ordering::SeqCst), 1);
+    h.shutdown().await;
+}
+
+/// The quota must refuse the second turn *without spending a gateway call*.
+///
+/// Asserting on the mock's hit counters is the point: a quota that only changed
+/// the stop reason while still calling the gateway would pass a reply-shaped
+/// assertion but save no money.
+#[tokio::test]
+async fn e2e_turn_quota_refuses_without_calling_gateway() {
+    let (gateway, st) = spawn_gateway(Scenario::HappyMultiFrame).await;
+    let mut h = Harness::spawn_with_env(
+        &gateway,
+        &[
+            ("INTEL_MAX_TURNS_PER_WINDOW", "1"),
+            ("INTEL_QUOTA_WINDOW_SECS", "3600"),
+        ],
+    )
+    .await;
+    h.initialize().await;
+    let sid = h.session_new().await;
+
+    let (first, _) = h.prompt(&sid, &harness_prompt_named()).await;
+    assert_eq!(first, "end_turn", "first turn is within quota");
+    let messages_after_first = st.messages_hits.load(Ordering::SeqCst);
+    assert_eq!(messages_after_first, 1, "first turn calls the gateway once");
+
+    let (second, _) = h.prompt(&sid, &harness_prompt_named()).await;
+    assert_eq!(second, "refusal", "second turn is over quota");
+    assert_eq!(
+        st.messages_hits.load(Ordering::SeqCst),
+        messages_after_first,
+        "a throttled turn must not reach the gateway"
+    );
+    assert_eq!(
+        st.sessions_created.load(Ordering::SeqCst),
+        1,
+        "a throttled turn must not create an intel session either"
+    );
+    assert!(
+        st.relay_posts.load(Ordering::SeqCst) >= 2,
+        "the refusal must be visible in the channel, not silent"
+    );
+
+    h.shutdown().await;
+}
+
+/// Setting the limit to 0 disables enforcement rather than blocking everything.
+#[tokio::test]
+async fn e2e_turn_quota_zero_is_disabled() {
+    let (gateway, st) = spawn_gateway(Scenario::HappyMultiFrame).await;
+    let mut h = Harness::spawn_with_env(&gateway, &[("INTEL_MAX_TURNS_PER_WINDOW", "0")]).await;
+    h.initialize().await;
+    let sid = h.session_new().await;
+
+    for _ in 0..3 {
+        let (reason, _) = h.prompt(&sid, &harness_prompt_named()).await;
+        assert_eq!(reason, "end_turn", "quota disabled must not refuse");
+    }
+    assert_eq!(
+        st.messages_hits.load(Ordering::SeqCst),
+        3,
+        "all three turns reach the gateway when the quota is off"
+    );
+
     h.shutdown().await;
 }
 

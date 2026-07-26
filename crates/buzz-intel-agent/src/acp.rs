@@ -17,6 +17,7 @@ use crate::config::{Config, EntityMode, ForwardSystemPrompt, SessionMode, PROTOC
 use crate::error::AdapterError;
 use crate::intel::{FrameKind, IntelClient, SseFrame};
 use crate::prompt::parse_prompt;
+use crate::quota::TurnQuota;
 use crate::reply::RelayPublisher;
 use crate::session_ensure::{get_or_create_intel_session, CreateLockMap};
 use crate::state::StateStore;
@@ -51,6 +52,8 @@ struct App {
     /// Single-flight locks for intel session creation per mapping key.
     create_locks: CreateLockMap,
     relay: Option<RelayPublisher>,
+    /// Per-scope LLM turn quota, checked before any paid gateway call.
+    quota: Mutex<TurnQuota>,
 }
 
 /// Run the ACP NDJSON server until stdin EOF or SIGTERM.
@@ -83,6 +86,7 @@ pub async fn run_server(cfg: Config) -> Result<(), AdapterError> {
         sessions: Mutex::new(HashMap::new()),
         create_locks: Mutex::new(HashMap::new()),
         relay,
+        quota: Mutex::new(TurnQuota::new(cfg.quota)),
     });
 
     let (wire_tx, wire_rx) = mpsc::channel::<WireMsg>(WIRE_CHANNEL_CAP);
@@ -521,6 +525,13 @@ async fn run_turn(
         return Err(AdapterError::Cancelled);
     }
 
+    // Cost gate. This must sit ahead of `ensure_and_run`, because that path can
+    // create an intel session as well as send the message — both are paid
+    // gateway calls. Refusing here means a throttled turn costs nothing.
+    if let Some(reason) = enforce_turn_quota(app, acp_session_id, parsed, epoch).await {
+        return Ok(reason);
+    }
+
     let agent_id = app.agent_id.lock().await.clone().ok_or_else(|| {
         AdapterError::Config("agent_id not resolved; call initialize first".into())
     })?;
@@ -931,6 +942,88 @@ fn build_outbound_message(
         }
     }
     prompt_text.to_owned()
+}
+
+/// Community component of the quota scope: the relay host, never the full URL
+/// (which can carry a token in some deployments) and never the key.
+fn quota_community(cfg: &Config) -> Option<String> {
+    let raw = cfg.relay_url.as_deref()?;
+    let without_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    // Strip any userinfo so credentials can never reach a log line.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Build the quota scope key for this turn.
+fn quota_scope_key(
+    cfg: &Config,
+    acp_session_id: &str,
+    parsed: &crate::prompt::ParsedPrompt,
+) -> String {
+    let community = quota_community(cfg);
+    let channel = parsed
+        .channel_id
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| format!("acp:{acp_session_id}"));
+    crate::quota::scope_key(community.as_deref(), Some(&channel), &cfg.agent)
+}
+
+/// Enforce the per-scope turn quota.
+///
+/// Returns `Some(stop_reason)` when the turn must not proceed. The caller
+/// returns that reason as a normal ACP result — a throttled turn is a refusal,
+/// not an adapter error, so the harness does not treat it as a crash and retry.
+async fn enforce_turn_quota(
+    app: &Arc<App>,
+    acp_session_id: &str,
+    parsed: &crate::prompt::ParsedPrompt,
+    epoch: u64,
+) -> Option<String> {
+    if !app.cfg.quota.is_enabled() {
+        return None;
+    }
+
+    let key = quota_scope_key(&app.cfg, acp_session_id, parsed);
+    let decision = {
+        let mut quota = app.quota.lock().await;
+        quota.check_and_record_at(&key, std::time::Instant::now())
+    };
+
+    match decision {
+        crate::quota::QuotaDecision::Allow { remaining } => {
+            tracing::debug!(scope = %key, remaining, "turn quota ok");
+            None
+        }
+        crate::quota::QuotaDecision::Deny {
+            limit,
+            retry_after_secs,
+        } => {
+            let window_secs = app.cfg.quota.window.as_secs();
+            // `key` is safe to log: host, channel uuid, agent name — no secrets.
+            tracing::warn!(
+                scope = %key,
+                limit,
+                window_secs,
+                retry_after_secs,
+                "turn quota exceeded; refusing turn without calling the gateway"
+            );
+            let text = crate::quota::quota_exceeded_message(limit, window_secs, retry_after_secs);
+            let _ = post_error_reply(
+                app,
+                parsed.channel_id,
+                parsed.reply_to_event_id.as_deref(),
+                &text,
+                epoch,
+                acp_session_id,
+            )
+            .await;
+            Some("refusal".to_owned())
+        }
+    }
 }
 
 fn session_mapping_key(

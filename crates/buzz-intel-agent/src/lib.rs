@@ -14,6 +14,7 @@ pub mod config;
 pub mod error;
 pub mod intel;
 pub mod prompt;
+pub mod quota;
 pub mod reply;
 pub mod session_ensure;
 pub mod state;

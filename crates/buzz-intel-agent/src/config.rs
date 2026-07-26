@@ -147,6 +147,17 @@ pub struct Cli {
     #[arg(long, env = "INTEL_KEEPALIVE_SECS", default_value = "60")]
     pub keepalive_secs: u64,
 
+    /// Max paid gateway turns per quota window, per channel+agent scope.
+    ///
+    /// `0` disables the quota. This is an LLM **cost** bound and is unrelated to
+    /// the relay's protocol admission rate limiting.
+    #[arg(long, env = "INTEL_MAX_TURNS_PER_WINDOW", default_value = "30")]
+    pub max_turns_per_window: u32,
+
+    /// Quota window length in seconds.
+    #[arg(long, env = "INTEL_QUOTA_WINDOW_SECS", default_value = "3600")]
+    pub quota_window_secs: u64,
+
     /// Post owner-visible ⚠️ replies on failures.
     #[arg(long, env = "INTEL_ERROR_REPLIES", default_value = "true")]
     pub error_replies: String,
@@ -213,6 +224,8 @@ pub struct Config {
     pub auth_tag: Option<String>,
     /// Max NDJSON line size.
     pub max_line_bytes: usize,
+    /// Per-scope LLM turn quota (cost bound, not protocol admission).
+    pub quota: crate::quota::QuotaConfig,
 }
 
 impl Config {
@@ -274,6 +287,7 @@ impl Config {
             sse_idle_timeout: Duration::from_secs(cli.sse_idle_timeout_secs.max(1)),
             turn_timeout: Duration::from_secs(cli.turn_timeout_secs.max(1)),
             keepalive: Duration::from_secs(cli.keepalive_secs.max(1)),
+            quota: crate::quota::QuotaConfig::new(cli.max_turns_per_window, cli.quota_window_secs),
             error_replies,
             state_path,
             relay_url,
