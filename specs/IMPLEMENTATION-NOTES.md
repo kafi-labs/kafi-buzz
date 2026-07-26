@@ -1510,3 +1510,89 @@ README states the ceiling is `2 × INTEL_MAX_TURNS_PER_WINDOW`, because right no
 
 **Also settled in passing:** the "does a stale persisted session recover?" question is answered
 by the same code — yes, it recreates and retries exactly once, then surfaces the error.
+
+---
+
+**D-L64 — REAL BYPASS: a channel-less ACP client gets a fresh quota budget per reconnect.**
+
+Found by the p8 enumeration lane, which ranked it #1 and was right to. I had missed it entirely.
+
+`acp.rs:962-972` builds the quota scope key, and when a prompt has no `channel_id` it uses:
+
+```rust
+let channel = parsed.channel_id.map(|c| c.to_string())
+    .unwrap_or_else(|| format!("acp:{acp_session_id}"));
+```
+
+`session/new` (`acp.rs:362-375`) mints a fresh UUID **without calling the gateway** — it is pure
+local state. So a client that opens a new ACP session gets a **new scope key and therefore a
+brand-new full budget**, as many times as it likes. Nothing rate-limits `session/new`.
+
+**This is reachable in production, not hypothetical.** The desktop app registers `intel` as an
+ACP runtime (commit `a7b4438e`), so ACP prompts that never pass through a Buzz channel are a
+real surface. A cost ceiling that any client resets by reconnecting is not a ceiling.
+
+**Fix being implemented:** channel-less prompts use the stable `scope_key(community, None,
+agent)` — the existing `nochannel` sentinel — instead of the per-session key. Channel-scoped
+prompts are unchanged.
+
+**Trade-off I chose, explicitly:** all channel-less traffic for one agent now shares a single
+budget, so one noisy direct-ACP client can exhaust it for other channel-less clients. I accept
+that. For a *cost* control the correct failure direction is toward refusing, not toward
+unbounded spend — a shared budget that occasionally over-refuses beats a private budget that
+never binds. TDD: the failing test came first
+(`e2e_missing_channel_cannot_bypass_quota_with_new_acp_session`), because a test that passes
+before the fix proves nothing.
+
+---
+
+**D-L65 — CORRECTIONS TO MY OWN D-L63, from the same lane.**
+
+Two things I got wrong or stated too narrowly. Both matter, so they are recorded rather than
+quietly edited.
+
+1. **The amplification has TWO layers, not one.** I documented only the outer session-gone
+   retry (`acp.rs:542-567`). There is also an **inner no-frame retry** at `acp.rs:708-724` that
+   can call `/messages` twice within a single `ensure_and_run`. And an existing test —
+   `mock_gateway_e2e.rs:631-646` — *already demonstrates* one prompt creating two sessions and
+   making at least two message calls. So the behaviour was observable in the suite the whole
+   time; what was missing was any assertion tying it to the quota contract. My "2x" was right
+   in spirit and wrong about the mechanism.
+
+2. **The window-seam burst is `2N−1`, not `2N`.** The window is *first-turn-anchored*: the
+   first turn both starts the window and consumes a slot, so the most obtainable arbitrarily
+   close to a seam is `(N−1)` before plus `N` after. A small correction, but the kind that
+   matters when someone is reasoning about a spend ceiling. Not worth a test — the exact reset
+   boundary is already pinned by `window_resets_after_it_elapses` (`quota.rs:230-247`).
+
+**Why I am logging my own errors here rather than just fixing the text:** this log's value
+depends on it being a record of what was actually believed and when. D-L63 was committed and
+pushed before this correction arrived; silently rewriting it would make the log look more
+reliable than the process that produced it.
+
+---
+
+**D-L66 — Four further real findings, deliberately NOT fixed this iteration.**
+
+Ranked by whether they would bite the unattended wren deployment. I am recording rather than
+acting because each needs a decision I should not make alone, and this iteration already has
+one code change in flight.
+
+| # | Finding | Why it is real | Why not now |
+|---|---|---|---|
+| 1 | **Quota resets on every process restart**, and is per-process (`acp.rs:81-90`; windows are not in `StateStore`) | A `systemctl restart` — which wren has already had — instantly grants a fresh full window. Two replicas would each grant a full budget | This is the open question already logged as D-L54. Persisting it is a design decision (where? shared store?) that is the user's call |
+| 2 | **`evict_expired_at` is never called in production** (`quota.rs:158-164`; repo search finds it only in its own unit test at `quota.rs:332-345`) | The `windows` map grows for process lifetime, one entry per unique scope. Made *worse* by the D-L64 per-session keys — which the fix now removes | Slow-burn, not urgent on a small community, and wiring eviction needs a call site decision |
+| 3 | **A quota refusal can be silent.** The deny path discards `post_error_reply`'s result and still returns `refusal` (`acp.rs:1014-1024`) | README promises the owner sees a channel message. If the relay post fails, the turn is refused with **no user-visible explanation** — looks like the agent ignored them | Needs a decision on whether to fail the turn loudly or just log; either way it is observability, not correctness |
+| 4 | **`retry_after_secs` floors instead of rounding up**, contradicting its own comment (`quota.rs:132-139`, `as_secs().max(1)`) | Can understate by nearly a second, causing one premature retry that is then denied again | Genuinely cosmetic. Listed only so it is not rediscovered as a mystery |
+
+**The p8 lane also told me what NOT to test**, which I value as much as the findings: no
+same-process race test (mutex semantics, per D-L62), no standalone seam-burst test, no further
+zero-disabled tests, no ws-vs-wss scope tests (config normalisation already collapses them, and
+`cfg` is immutable within one `App` so a single process cannot alternate spellings). Declining
+to write those is a result, not a gap.
+
+**Lane loss to be honest about:** the parallel gateway/SSE enumeration (p4) returned `done`
+without writing its report file, and its pane is too narrow to recover output from. So malformed
+SSE frames, streams that end with no terminal frame, and multi-byte UTF-8 split across chunk
+boundaries — the last one directly on the proven Indonesian+emoji path — remain **unexamined**.
+That is an open gap, not a clean bill of health.
