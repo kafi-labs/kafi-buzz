@@ -8,9 +8,11 @@
 #   - ssh exe.dev works; docker available on the target VM (exeuntu)
 #   - Prebuilt linux/amd64 binaries at:
 #       artifacts/linux-amd64-57141538/{buzz,buzz-acp,buzz-intel-agent}
+#       artifacts/linux-amd64-57141538/compute-auth-tag (optional)
 #     (buzz = agent-first CLI for channel create / mention — runs ON the VM)
 #   - INTEL_API_KEY_FILE (default: ~/.config/buzz/intel-e2e.key)
-#   - Local tools: openssl, python3+coincurve, cargo (for compute_auth_tag once)
+#   - Local tools: openssl, python3+coincurve; cargo only when the prebuilt
+#     compute-auth-tag cannot run on the driver host
 #
 # This script does NOT commit, push, or switch git branches. It copies compose.yml
 # to a scratch dir and hand-patches buzz-git-init (no cherry-pick).
@@ -29,6 +31,8 @@
 #       on-VM CLI + RELAY_URL=ws://127.0.0.1:3000 makes Host match automatic.
 #   I3  optional 8000:3000 publish — not required for loopback path; omitted.
 #   I9  macOS tar xattrs — use COPYFILE_DISABLE=1 when packaging from macOS.
+#   I5  prebuilt linux/amd64 `compute-auth-tag` removes the cargo dependency on
+#       matching driver hosts; macOS/non-linux drivers still fall back to cargo.
 #
 # STILL OPEN (must stay hand-worked or wait for upstream):
 #   I1  compose.yml lacks buzz-git-init until a branch lands — still hand-patched
@@ -36,8 +40,6 @@
 #   I2  public wss://$VM ideal vs loopback — default remains loopback because
 #       fresh exe.dev 443 may auth-wall; set USE_PUBLIC_ORIGIN=1 to try public.
 #   I4  sudo still required for /opt/buzz-intel + systemd (exeuntu reality).
-#   I5  NIP-OA BUZZ_AUTH_TAG still needs cargo + buzz-sdk compute_auth_tag on
-#       the driver host (not packaged as a standalone tool).
 #   I8  agent may start with 0 channels if started before channel+member; this
 #       script creates the channel then restarts the agent (addresses I8).
 #
@@ -64,6 +66,10 @@ need ssh; need scp; need openssl; need python3; need tar
 [[ -x "$ARTIFACT_DIR/buzz-acp" ]] || die "missing $ARTIFACT_DIR/buzz-acp"
 [[ -x "$ARTIFACT_DIR/buzz-intel-agent" ]] || die "missing $ARTIFACT_DIR/buzz-intel-agent"
 [[ -x "$ARTIFACT_DIR/buzz" ]] || die "missing $ARTIFACT_DIR/buzz (linux/amd64 CLI — required for on-VM channel create / mention)"
+AUTH_TAG_HELPER="$ARTIFACT_DIR/compute-auth-tag"
+if [[ -e "$AUTH_TAG_HELPER" && ! -x "$AUTH_TAG_HELPER" ]]; then
+  echo "WARN: optional $AUTH_TAG_HELPER is not executable; cargo fallback will be used" >&2
+fi
 [[ -f "$INTEL_KEY_FILE" ]] || die "missing INTEL_API_KEY_FILE=$INTEL_KEY_FILE"
 [[ -f "$ROOT/deploy/compose/compose.yml" ]] || die "missing deploy/compose/compose.yml"
 
@@ -151,14 +157,18 @@ PY
 # shellcheck disable=SC1090
 source "$SCRATCH/pubkeys.env"
 
-# --- NIP-OA auth tag (I5 — still open: cargo on driver host) ---
-if ! command -v cargo >/dev/null; then
-  die "cargo required for compute_auth_tag (buzz-sdk example)"
-fi
+# --- NIP-OA auth tag (I5 — prebuilt helper on linux/amd64, cargo fallback elsewhere) ---
 OWNER_SK=$(tr -d '\n' < "$SCRATCH/keys/owner.sk")
 AGENT_SK=$(tr -d '\n' < "$SCRATCH/keys/agent.sk")
-AUTH_TAG=$(cargo run --quiet --release -p buzz-sdk --example compute_auth_tag -- "$OWNER_SK" "$AGENT_PUB" "" 2>/dev/null) \
-  || die "compute_auth_tag failed — run from a buzz checkout with buzz-sdk"
+AUTH_TAG=""
+if [[ -x "$AUTH_TAG_HELPER" && "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
+  AUTH_TAG=$("$AUTH_TAG_HELPER" "$OWNER_SK" "$AGENT_PUB" "" 2>/dev/null) || AUTH_TAG=""
+fi
+if [[ -z "$AUTH_TAG" ]] && command -v cargo >/dev/null; then
+  AUTH_TAG=$(cargo run --quiet --release -p buzz-sdk --example compute_auth_tag -- "$OWNER_SK" "$AGENT_PUB" "" 2>/dev/null) || AUTH_TAG=""
+fi
+[[ -n "$AUTH_TAG" ]] \
+  || die "neither runnable prebuilt $AUTH_TAG_HELPER nor cargo fallback for buzz-sdk compute_auth_tag produced a non-empty auth tag"
 printf '%s\n' "$AUTH_TAG" > "$SCRATCH/keys/auth_tag.json"
 chmod 600 "$SCRATCH/keys/auth_tag.json"
 
