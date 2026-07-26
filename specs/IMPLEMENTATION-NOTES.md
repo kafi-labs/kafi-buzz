@@ -2152,3 +2152,50 @@ nonexistent tampering bug.
 artifact*, never by rebuilding. And when a property is inferred from a single observation, label it
 as one observation — "these two builds matched" is a data point; "the build is deterministic" is a
 claim requiring a controlled test I did not run.
+
+---
+
+**D-L82 — SUCCESS PATH PROVEN LIVE. The restructuring did not regress, and the new guards do not
+false-positive on real answers.**
+
+A fresh relay + intel adapter built from exact source `19d74ec3` on a throwaway
+(`vm-buzz-proof-8ab897`), two real gateway turns, both answered. Verified by me: the VM is gone
+(count 49→50→**49**, zero matches), wren is **untouched** (PID `2795007`, active, `NRestarts=0` —
+the worker deliberately did not check it because I forbade contact, so I checked myself), and the
+credentials really are persisted.
+
+| Turn | Event | Content | Journal path |
+|---|---|---|---|
+| `17 * 23` | `312728853155b775…` | `391.` | `posted reply to buzz` → `acp::stream: 391.` → `turn complete … end_turn` |
+| Indonesian + emoji | `e5084d1599e4689a…` | `Hasilnya adalah 15 🔥.` | normal publish/stream/`end_turn` |
+
+**The critical result is a negative one: neither turn took the new incomplete-response or
+empty-response branches.** That was the actual risk of `5f6c21ee`. A `terminal_received` check that
+was even slightly too strict would have made *every genuine answer* look truncated — converting a
+silent-truncation bug into a total outage, which is far worse. Nine iterations of mock tests could
+not have settled that, because the mocks all emit `event: done`; only a real gateway stream could.
+`posted reply to buzz` firing is the specific log line from the block I de-indented, so the moved
+code is confirmed executing in production conditions.
+
+**Multi-byte is now proven end-to-end, not just at the parser.** D-L70 established that
+`sse_multibyte_split_mid_codepoint_is_lossless` pins the SSE layer. This proves the whole pipeline:
+live gateway → SSE byte parser → chunk assembly → relay kind-9 post → read back, with the 🔥
+intact. That closes the concern I had raised — and over-raised — three times.
+
+**Bootstrap validated a third time with zero manual repair:** *"No step outside the bootstrap script
+was needed to repair or finish the stack."* Given that the same script was hand-patched repeatedly in
+early iterations, that is a real convergence signal.
+
+**The D-L78 lesson worked as a mechanism rather than a note.** Because the brief *required*
+persistence before teardown, `~/.config/buzz/proof-19d74ec3/` now holds `owner.sk`, `owner.pub`,
+`agent.sk`, `agent.pub`, and `auth_tag.json` at mode 0600 in a 0700 directory. Contrast wren, whose
+owner key vanished with a `$SCRATCH` dir because nothing forced that step. **The difference between
+the two outcomes is not that I learned something — it is that the lesson was encoded in the next
+brief.**
+
+**What this does and does not resolve about wren.** The code is proven good, so wren is running
+correct software. It remains **unreachable** (D-L78) and that still needs the user's decision, since
+re-provisioning means changing `BUZZ_AUTH_TAG` on production. What has changed is that the repair is
+now de-risked: this run is a working template — generate keypair, compute auth tag, persist at 0600,
+verify a real answer — executed successfully end to end. If the user says go, it is a known
+procedure rather than an experiment.
