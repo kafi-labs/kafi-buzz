@@ -2489,3 +2489,64 @@ intent). Catching it before the brief is the whole value.
 exists on this branch. They were written in the `web-client-intel-console-assessment` worktree and
 never merged — the same scattering as the specs. Work that is real, reviewed, and unreachable from
 the branch it belongs to is indistinguishable from work that was never done.
+
+---
+
+## Iteration 13–14 — finally building the thing that was asked for
+
+**D-L90 — The inert gateway field is fixed (`dd11b71a`), and the flag now has two names because it
+was always two ideas.**
+
+`runtime_metadata_env_vars` skipped provider injection whenever `provider_locked` was true, and
+intel was registered with **both** `provider_env_var: Some("INTEL_GATEWAY_URL")` and
+`provider_locked: true`. That variable appears nowhere else in the Tauri backend, so there was no
+second path: a URL typed into the labelled field went nowhere.
+
+Split into `provider_locked` (UI catalog lock only) and `inject_provider_env` (whether
+`provider_env_var` is exported to the child), with comments on **both** stating what each does and
+does not control. The fix is not "the behaviour is right"; it is "the next reader cannot re-conflate
+them."
+
+Per-runtime, only intel changes — I required the accounting rather than accepting a blanket default:
+
+| Runtime | `provider_locked` | `inject_provider_env` | Effect |
+|---|---:|---:|---|
+| Goose | false | true | unchanged |
+| Claude Code | true | false | unchanged (Claude-style lock intact) |
+| Codex | false | true | unchanged (no `provider_env_var`, so a no-op) |
+| Buzz Agent | false | true | unchanged |
+| **Intelligence Platform** | **true** | **true** | catalog stays suppressed, **URL now injected** |
+
+The lane went beyond the brief in the right direction: it added `apply_runtime_metadata_env` and
+wired it into `spawn_agent_child`, so the regression test asserts the **real** `std::process::Command`
+env rather than the helper's return value —
+`command.get_envs().find(|(key, _)| *key == OsStr::new("INTEL_GATEWAY_URL"))`. That was the assertion
+I most wanted and explicitly said not to substitute something weaker for.
+
+Verified by me: **1620 desktop tests pass**, clippy `--all-targets -D warnings` clean, nine files all
+under `desktop/`.
+
+**Precision that matters for the changelog:** this was never a total break. The user env passthrough
+(`runtime.rs:1987-1991`) meant anyone who knew to add `INTEL_GATEWAY_URL` by hand got a working
+agent. What was broken is the *labelled field that appeared to configure the gateway and silently did
+nothing* — which is worse than an absent field, because an absent field prompts the question.
+
+**Sixth instance of the loop's dominant pattern**, and the most on-the-nose: `discovery.rs:216`
+carries the comment `// "model" dropdown = which deployed intel agent (INTEL_AGENT).` The dropdown
+was **always** the design intent. It was never built, and the comment describing it survived
+unchallenged next to a free-text input.
+
+---
+
+**D-L91 — A measurement-tooling error, third of its kind.**
+
+`grep -E "^test result" | tail -3` showed `3 passed` and I nearly reported the desktop suite as
+alarmingly small. The truncated line was `1617 passed`. Real total: **1620**.
+
+Third time the *measurement command* — not the measurement — has been the weak link, after piping a
+command whose exit code was the evidence (D-L69, D-L85) and probing a port with bash-only `/dev/tcp`
+under zsh (which produced a false negative that nearly made me retract a correct claim).
+
+The through-line: **each error came from a convenience wrapper around a sound check** — a pipe, a
+shell builtin, a `tail`. The checks themselves have been reliable. Worth carrying: when a result is
+surprising, suspect the harness before the finding, and re-run the bare command.
