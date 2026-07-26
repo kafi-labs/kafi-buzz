@@ -1698,3 +1698,104 @@ was `tail`, so that was `tail`'s status, not the script's. The `SUMMARY:` line i
 signal. Same shape of error as D-L61 — the check that *looks* like it confirms something while
 actually measuring the wrong thing. Two occurrences in one session is a pattern, not bad luck:
 **when a command's exit status is the evidence, do not pipe it.**
+
+---
+
+## Iteration 9 — the SSE surface, finally examined
+
+The gap I flagged three times as "unexamined, not a clean bill of health" is now examined. It
+contained one thing I was wrong about and three real defects.
+
+**D-L70 — MY OWN ALARM WAS UNFOUNDED: the UTF-8 path is the best-covered code in the crate.**
+
+I repeatedly flagged multi-byte UTF-8 on the live Indonesian+emoji path as an unexamined risk.
+It is not a risk at all. **Correct by construction**, per `intel.rs:389-393`:
+
+> Incremental SSE parser that tolerates frames split across arbitrary **byte** chunks.
+> Incomplete UTF-8 sequences at chunk boundaries stay in the byte buffer until a complete line
+> (`\n`) arrives; only then is the line decoded. This avoids `from_utf8_lossy` corruption of
+> multi-byte codepoints split by the network.
+
+That is sound: `\n` is `0x0A`, and no byte of a multi-byte UTF-8 sequence can be `< 0x80`, so a
+line boundary is always a safe decode point. Decoding uses **strict** `String::from_utf8`
+(`intel.rs:449`), which *errors* on invalid input rather than silently substituting U+FFFD —
+the right choice, since it converts corruption into a visible failure.
+
+And the exact regression I hypothesised already exists — `intel.rs:963-998`:
+
+```rust
+let text = "Jawaban: baik 🔥 terima kasih 测试";
+let mid = emoji_at + 2;              // middle of the 4-byte sequence
+assert_eq!(frames[0].response_text.as_deref(), Some(text));
+assert!(!...contains('\u{FFFD}'));
+```
+
+Six tests cover both layers. `chunk.rs` receives an already-valid `&str` and only keeps relay
+split points on character boundaries (`floor_char_boundary`, `is_char_boundary`) — it never
+reassembles network bytes, so it cannot be the source of a split-character bug.
+
+**The lesson is about my own reporting, not the code.** I was right that the surface was
+*unexamined* and right to keep saying so. But I let "unexamined" drift toward implying "probably
+broken," and repeated it three times, which is how an honest gap turns into manufactured alarm.
+Had I not checked before dispatching, I would have commissioned tests that already exist.
+**"I have not verified this" and "this is likely wrong" are different claims and must be said
+differently.**
+
+---
+
+**D-L71 — REAL AND SERIOUS: a truncated answer is published as if it were complete.**
+
+Found independently by me and by the p8 lane, same lines, same verdict.
+
+On a clean stream close the read loop simply breaks (`intel.rs:306-320`, `Ok(None) => break`),
+`parser.finish()` flushes any trailing event, and the function returns **`Ok(result)`
+unconditionally** (`intel.rs:344-353`). `TurnStreamResult` (`intel.rs:55-66`) records
+`received_frame` but has **no field for whether a terminal `Done` frame ever arrived**, and
+`apply_frame` only signals stop on `Done` or `Error` (`intel.rs:378`).
+
+So if the gateway — or a proxy, or the network — closes mid-generation after a partial
+`RESPONSE`, that partial text is published as **both** a kind-9 relay message and the final ACP
+message (`acp.rs:763`, `777-815`) and the turn returns `end_turn` (`acp.rs:817`). It is
+indistinguishable from a complete answer.
+
+**Nothing catches it.** The SSE idle timeout only bounds *waiting* for `stream.next()`; a clean
+EOF resolves immediately. The outer whole-turn timeout (`acp.rs:443-456`) sees an already
+successful turn. And no test covers it, because every mock success body includes `event: done`
+(`mock_gateway_e2e.rs:85-93`).
+
+**Why this is the most serious defect found in nine iterations.** wren reaches
+`intel-platform.exe.xyz` across the public internet, where mid-stream connection drops are
+routine, not exotic. And this agent answers money-adjacent questions unattended. A truncated
+*number* presented as an answer is actively dangerous — the reader acts on it with no signal
+anything is missing. It is the precise inverse of the standing Kafi invariant: **never invent,
+report incomplete instead.**
+
+---
+
+**D-L72 — Also real: an empty answer is reported as ordinary success.**
+
+When the stream completes normally but the accumulated text is empty or whitespace-only, nothing
+is posted and the turn returns an ordinary `end_turn` — a **silent unanswered turn**. On an
+unattended agent the owner sees no reply and no error, indistinguishable from the agent ignoring
+them.
+
+Worth separating two things the lane was careful about: "empty content creates no kind-9 event"
+is **already correct and pinned** (`chunk.rs:80-83`, `reply.rs:85-89`) and must not change. The
+defect is only that an empty gateway answer is reported as *success*.
+
+**The design call I made for both D-L71 and D-L72**, so it is on record as mine: when the
+adapter does not have a complete answer it must say so **visibly**, through the owner-visible
+error path already used for 401/429/503 — not publish a partial as complete, and not return a
+silent success. Consistency with the existing mid-turn error behaviour was the deciding argument;
+inventing a second notification mechanism for "incomplete" would have been the worse choice.
+
+**Deliberately out of scope for this fix**, so they are not silently dropped: cancellation
+latency (cancel currently waits on I/O; billing cannot be guaranteed abandoned, since the
+gateway has no abort API), a `200` response with a non-SSE content-type collapsing to silent
+success (a realistic proxy failure — same silent-success family, worth doing next), and the SSE
+buffer cap not accounting for vector overhead.
+
+**The pattern across D-L71, D-L72 and the non-SSE case is one root cause:** the adapter cannot
+distinguish *"the model finished"* from *"the stream stopped producing."* Three different symptoms,
+one missing concept. That is worth more than the three individual fixes, because it predicts where
+the fourth will be.
