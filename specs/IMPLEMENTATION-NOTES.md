@@ -2848,3 +2848,62 @@ security defect.
 exactly this shape of problem — custodial secrets so a browser can act without holding them. Its
 README already records the honest cost ("the operator can sign as any user") and its open question
 (custodial vs NIP-46). Whatever is decided here should be decided alongside that, not separately.
+
+---
+
+## Iteration 21–22 — an adversarial pass over code that was already green
+
+**D-L100 — MY "FIXED" CLAIM WAS HALF TRUE, and the population it failed was the worst one.**
+
+Fixed in `e1d32356`. `dd11b71a` reported the inert gateway field repaired. It was repaired **for
+fresh records only**. `apply_runtime_metadata_env` runs at `runtime.rs:1905`; `merged_user_env`
+writes at `:1986`; `Command::env` overwrites on a repeated key. So a pre-existing
+`env_vars.INTEL_GATEWAY_URL` beat the structured provider, and legacy `INTEL_AGENT` beat the
+picker-written model.
+
+**Who that hit is the point.** Manual env was the *only* working route before `dd11b71a` — so the
+users who had applied the workaround were exactly the ones for whom the labeled field *still*
+silently did nothing. I shipped a fix, verified it, reported it, and it did not work for the people
+who had already been bitten by the bug.
+
+Every gate was green through all of this. It surfaced only because I asked an adversarial question
+about code I had already shipped and already verified. **"Tests pass" and "the feature works for
+existing users" are different claims, and this branch has now confirmed that twice** (cf. D-L78,
+where every health check passed against an unreachable agent).
+
+**The precedence rule shipped is better than the one I specified.** I would have made the structured
+field unconditionally authoritative; the implementation keeps legacy env as a **fallback when no
+structured value exists**, so an env-only migrated record keeps working and no migration is needed.
+Undeclared keys keep last-write-wins (tested with `INTEL_API_KEY` and an arbitrary `CUSTOM_SETTING`).
+Readiness applies the same filter so it cannot disagree with the spawned child. And superseding is
+not silent in the other direction either — spawn warns, naming the key and never its value.
+
+**Second defect, the eighth instance of this log's pattern:** `build_provider_field`
+(`config_bridge/reader.rs:359-374`) returned literal `"Anthropic (locked)"` for **any**
+`provider_locked` runtime. Intel is locked only to suppress the generic LLM catalog, so its managed
+config panel displayed a **false Anthropic constraint** instead of its gateway. The same conflation
+`dd11b71a` split, surviving in a path I never checked — and the first instance here that showed a
+user a factually wrong vendor name. Now: locked **without** `provider_env_var` stays the Claude case
+and still reads Anthropic; locked **with** one resolves and displays the real gateway.
+
+**The implementer declined my instruction, correctly.** I asked for `tracing::warn!`; this crate
+initialises no tracing subscriber, so the event would be discarded and fail the operational purpose
+it existed for. It used the module's established `eprintln!` path and said why. **Third time a lane
+has corrected my brief rather than following it into a hole, against five times my brief carried the
+defect.** The pattern holds: the executors are more reliable than my instructions, and what makes
+that visible is asking for *reasoning* rather than compliance.
+
+**Verdicts that came back reassuring**, recorded so nobody re-investigates: the roster fetch already
+guards stale responses with a monotonic generation counter (`RuntimeAgentNameField.tsx:307-353`) —
+real code, though not directly tested; runtime switching already clears `model` in both directions
+(`personaRuntimeModel.ts:42-50`); and ACP server mode cannot accidentally take the narrow credential
+check.
+
+**Still open from that pass, ranked** — recorded rather than silently dropped:
+
+| # | Finding | Why it matters |
+|---|---|---|
+| 1 | `Config`, `Cli`, `IntelClient` derive unrestricted `Debug` while holding `api_key` / `private_key` | No leak today — no `?cfg` call exists — but **one ordinary future debug statement creates one**. Cheap to make structurally impossible |
+| 2 | No timeout or kill path on the roster helper (`intel_agent_roster.rs:98-113`) | A gateway that accepts and never finishes leaves a child alive holding the bearer in its env; retries accumulate them |
+| 3 | Successful stdout is unredacted | A hostile/mistyped gateway could reflect the key in an agent `name`; only matters with an untrusted gateway or PATH substitution |
+| 4 | C3/C2 guarantees implemented but not pinned by tests | Real protection, unpinned contract |
