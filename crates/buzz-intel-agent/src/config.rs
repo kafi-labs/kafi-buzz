@@ -1,5 +1,6 @@
 //! Configuration loaded from environment variables and CLI flags.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -88,7 +89,7 @@ impl ForwardSystemPrompt {
 }
 
 /// CLI flags (mirror env vars for manual runs).
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "buzz-intel-agent",
     about = "ACP adapter for Intelligence Platform agents",
@@ -187,8 +188,40 @@ pub struct Cli {
     pub list_agents: bool,
 }
 
+impl fmt::Debug for Cli {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cli")
+            .field("gateway_url", &self.gateway_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            // This is a path only; Debug never reads or inlines file contents.
+            .field("api_key_file", &self.api_key_file)
+            .field("agent", &self.agent)
+            .field("org_id", &self.org_id)
+            .field("session_mode", &self.session_mode)
+            .field("entity_mode", &self.entity_mode)
+            .field("forward_system_prompt", &self.forward_system_prompt)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("sse_idle_timeout_secs", &self.sse_idle_timeout_secs)
+            .field("turn_timeout_secs", &self.turn_timeout_secs)
+            .field("keepalive_secs", &self.keepalive_secs)
+            .field("max_turns_per_window", &self.max_turns_per_window)
+            .field("quota_window_secs", &self.quota_window_secs)
+            .field("error_replies", &self.error_replies)
+            .field("state_dir", &self.state_dir)
+            .field("relay_url", &self.relay_url)
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("auth_tag", &self.auth_tag.as_ref().map(|_| "<redacted>"))
+            .field("auth_probe", &self.auth_probe)
+            .field("list_agents", &self.list_agents)
+            .finish()
+    }
+}
+
 /// Fully resolved runtime configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Gateway base URL without trailing slash.
     pub gateway_url: String,
@@ -226,6 +259,41 @@ pub struct Config {
     pub max_line_bytes: usize,
     /// Per-scope LLM turn quota (cost bound, not protocol admission).
     pub quota: crate::quota::QuotaConfig,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("gateway_url", &self.gateway_url)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("agent", &self.agent)
+            .field("org_id", &self.org_id)
+            .field("session_mode", &self.session_mode)
+            .field("entity_mode", &self.entity_mode)
+            .field("forward_system_prompt", &self.forward_system_prompt)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("sse_idle_timeout", &self.sse_idle_timeout)
+            .field("turn_timeout", &self.turn_timeout)
+            .field("keepalive", &self.keepalive)
+            .field("error_replies", &self.error_replies)
+            .field("state_path", &self.state_path)
+            .field("relay_url", &self.relay_url)
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("auth_tag", &self.auth_tag.as_ref().map(|_| "<redacted>"))
+            .field("max_line_bytes", &self.max_line_bytes)
+            .field("quota", &self.quota)
+            .finish()
+    }
 }
 
 impl Config {
@@ -442,6 +510,50 @@ mod tests {
         // Keep the tests hermetic even if the test runner exports INTEL_AGENT.
         cfg.agent.clear();
         cfg
+    }
+
+    #[test]
+    fn debug_output_redacts_cli_and_config_secrets_but_keeps_context() {
+        let api_secret = "intel_debug_api_secret";
+        let private_secret = "nsec_debug_identity_secret";
+        let auth_secret = "debug_auth_tag_secret";
+        let cli = Cli::try_parse_from([
+            "buzz-intel-agent",
+            "--gateway-url",
+            "https://debug-gateway.example.test",
+            "--api-key",
+            api_secret,
+            "--agent",
+            "debug-agent",
+            "--private-key",
+            private_secret,
+            "--auth-tag",
+            auth_secret,
+        ])
+        .expect("debug CLI should parse");
+        let cli_debug = format!("{cli:?}");
+
+        assert!(!cli_debug.contains(api_secret));
+        assert!(!cli_debug.contains(private_secret));
+        assert!(!cli_debug.contains(auth_secret));
+        assert!(cli_debug.contains("api_key: Some(\"<redacted>\")"));
+        assert!(cli_debug.contains("private_key: Some(\"<redacted>\")"));
+        assert!(cli_debug.contains("https://debug-gateway.example.test"));
+        assert!(cli_debug.contains("debug-agent"));
+
+        let mut cfg = Config::from_cli(&cli).expect("debug config should resolve");
+        cfg.api_key = api_secret.to_string();
+        cfg.private_key = Some(private_secret.to_string());
+        cfg.auth_tag = Some(auth_secret.to_string());
+        let config_debug = format!("{cfg:?}");
+
+        assert!(!config_debug.contains(api_secret));
+        assert!(!config_debug.contains(private_secret));
+        assert!(!config_debug.contains(auth_secret));
+        assert!(config_debug.contains("api_key: \"<redacted>\""));
+        assert!(config_debug.contains("private_key: Some(\"<redacted>\")"));
+        assert!(config_debug.contains("https://debug-gateway.example.test"));
+        assert!(config_debug.contains("debug-agent"));
     }
 
     #[test]

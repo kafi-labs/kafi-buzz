@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::managed_agents::resolve_command;
 
 const INTEL_ROSTER_AGENT_PLACEHOLDER: &str = "buzz-desktop-roster-probe";
+const INTEL_AGENT_ROSTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Unsaved Intelligence Platform credentials used for a roster lookup.
 #[derive(Deserialize)]
@@ -97,20 +98,50 @@ pub async fn list_intel_agents(
 
     let binary =
         resolve_command("buzz-intel-agent").ok_or_else(IntelAgentRosterError::unavailable)?;
-    let output = tokio::task::spawn_blocking(move || {
-        build_roster_command(&binary, &gateway_url, &api_key)
-            .output()
-            .map(|output| CapturedRosterOutput {
-                success: output.status.success(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
-    })
-    .await
-    .map_err(|_| IntelAgentRosterError::unavailable())?
-    .map_err(|_| IntelAgentRosterError::unavailable())?;
+    let output =
+        run_roster_command(&binary, &gateway_url, &api_key, INTEL_AGENT_ROSTER_TIMEOUT).await?;
 
     parse_roster_output(output)
+}
+
+async fn run_roster_command(
+    binary: &Path,
+    gateway_url: &str,
+    api_key: &str,
+    timeout: std::time::Duration,
+) -> Result<CapturedRosterOutput, IntelAgentRosterError> {
+    let child = spawn_roster_command(binary, gateway_url, api_key)?;
+    capture_roster_output(child, timeout).await
+}
+
+fn spawn_roster_command(
+    binary: &Path,
+    gateway_url: &str,
+    api_key: &str,
+) -> Result<tokio::process::Child, IntelAgentRosterError> {
+    let command = build_roster_command(binary, gateway_url, api_key);
+    let mut command = tokio::process::Command::from(command);
+    // The timed output future owns this kill-on-drop child. Dropping that
+    // future on timeout terminates the bearer-bearing helper.
+    command.kill_on_drop(true);
+    command
+        .spawn()
+        .map_err(|_| IntelAgentRosterError::unavailable())
+}
+
+async fn capture_roster_output(
+    child: tokio::process::Child,
+    timeout: std::time::Duration,
+) -> Result<CapturedRosterOutput, IntelAgentRosterError> {
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| IntelAgentRosterError::connection())?
+        .map_err(|_| IntelAgentRosterError::unavailable())?;
+    Ok(CapturedRosterOutput {
+        success: output.status.success(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 fn build_roster_command(binary: &Path, gateway_url: &str, api_key: &str) -> std::process::Command {
@@ -337,5 +368,91 @@ mod tests {
         assert_eq!(args, vec!["--list-agents"]);
         assert!(args.iter().all(|arg| !arg.contains(secret)));
         assert_eq!(api_key_env, Some(OsStr::new(secret)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn roster_timeout_reaps_helper_and_retry_leaves_no_previous_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let helper = temp.path().join("hanging-roster-helper");
+        let pid_file = temp.path().join("hanging-roster-helper.pid");
+        let pid_path = pid_file.to_string_lossy().into_owned();
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$INTEL_GATEWAY_URL\"\nexec sleep 30\n",
+        )
+        .expect("write hanging helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+            .expect("make helper executable");
+
+        for attempt in 0..2 {
+            let _ = std::fs::remove_file(&pid_file);
+            let child = spawn_roster_command(&helper, &pid_path, "intel_timeout_secret")
+                .expect("spawn hanging helper");
+            let pid = wait_for_helper_pid(&pid_file)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("helper never became ready before lookup timeout started: {error}")
+                });
+
+            let error = match capture_roster_output(child, std::time::Duration::from_secs(1)).await
+            {
+                Ok(_) => panic!("hanging helper must time out"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error,
+                IntelAgentRosterError::connection(),
+                "timeout attempt {attempt} must use the existing connection error"
+            );
+
+            wait_for_process_exit(pid).await;
+            assert!(
+                !process_is_alive(pid),
+                "timed-out helper from attempt {attempt} must be reaped before retry/return"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_helper_pid(pid_file: &Path) -> Result<u32, String> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match std::fs::read_to_string(pid_file) {
+                    Ok(contents) => {
+                        if let Ok(pid) = contents.parse::<u32>() {
+                            return Ok(pid);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("could not read helper pid file: {error}")),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "helper readiness timed out after 10 seconds".to_string())?
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: u32) {
+        for _ in 0..50 {
+            if !process_is_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }

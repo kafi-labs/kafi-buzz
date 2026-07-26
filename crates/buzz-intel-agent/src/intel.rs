@@ -1,5 +1,6 @@
 //! Intelligence Platform HTTP + SSE client.
 
+use std::fmt;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -68,13 +69,34 @@ pub struct TurnStreamResult {
 }
 
 /// Intel gateway client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IntelClient {
     http: reqwest::Client,
     base: String,
     api_key: String,
     org_id: Option<String>,
     sse_idle: Duration,
+}
+
+impl fmt::Debug for IntelClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IntelClient")
+            // Avoid delegating to reqwest's Debug: future client defaults may
+            // carry secret headers or proxy credentials.
+            .field("http", &"<configured>")
+            .field("base", &self.base)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("org_id", &self.org_id)
+            .field("sse_idle", &self.sse_idle)
+            .finish()
+    }
 }
 
 impl IntelClient {
@@ -843,6 +865,26 @@ fn extract_error_message(payload: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_client_secret_but_keeps_context() {
+        let secret = "intel_client_debug_secret";
+        let client = IntelClient {
+            http: reqwest::Client::new(),
+            base: "https://debug-gateway.example.test".to_string(),
+            api_key: secret.to_string(),
+            org_id: Some("debug-org".to_string()),
+            sse_idle: Duration::from_secs(42),
+        };
+
+        let debug = format!("{client:?}");
+
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("api_key: \"<redacted>\""));
+        assert!(debug.contains("https://debug-gateway.example.test"));
+        assert!(debug.contains("debug-org"));
+        assert!(debug.contains("42s"));
+    }
 
     #[test]
     fn error_envelope_native() {
