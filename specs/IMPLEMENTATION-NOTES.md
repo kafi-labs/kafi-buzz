@@ -1403,3 +1403,35 @@ is canonical from D-L58 onward.
 **Generalisation worth keeping:** a deliverable that is not committed is not delivered. This
 log spent seven iterations describing other people's unverified claims while being, itself,
 the least verified artefact in the tree.
+
+---
+
+**D-L61 — Read `/proc/<pid>/environ`, never grep the config files.**
+
+My health check grepped `/opt/buzz-intel/bin/run-harness.sh` and got
+`No such file or directory`. The launcher is at `/opt/buzz-intel/run-harness.sh` — the
+**binaries** are in `bin/`, the launcher is one level up. Third path mistake I have made in
+this same directory.
+
+The path error is trivia; the method error is not. `INTEL_MAX_TURNS_PER_WINDOW` is set in
+**three** places (systemd `Environment=`, `buzz-intel-agent.env`, and the launcher's
+`export`) and the launcher wins — that is the config-precedence trap from D-L52 that had two
+of three files reading `120` while the process actually ran `2`. Grepping *any* of those
+files can therefore agree with itself and still be wrong about the process.
+
+**The only authoritative read is the running process:**
+
+```bash
+sudo tr '\0' '\n' < /proc/<MainPID>/environ | grep -E '^INTEL_(MAX_TURNS|QUOTA)'
+```
+
+Confirmed live this iteration: `INTEL_MAX_TURNS_PER_WINDOW=120`,
+`INTEL_QUOTA_WINDOW_SECS=3600`, PID 2494038, `NRestarts=0`. The D-L52 incident repair holds.
+
+A file-path typo *fails loudly* and costs a retry. Reading the wrong-but-existing file
+*succeeds quietly* and returns a confident wrong answer — which is exactly how the quota
+incident stayed invisible. Prefer the check that cannot silently agree with itself.
+
+**Housekeeping note:** `/opt/buzz-intel/run-harness.sh.bak-pre-quota-proof-20260726T080953Z`
+and two `bin/*.bak.*` pairs remain on the VM. Left deliberately — they are the forensic trail
+of the D-L52 incident and the native-binary swap. Worth deleting only when the VM is torn down.
