@@ -743,11 +743,13 @@ async fn ensure_and_run(
         if app.cfg.error_replies {
             // This unattended agent can answer money-adjacent questions. A partial
             // number presented as complete is more dangerous than a visible error.
-            let _ = post_error_reply(
+            let text = owner_visible_error("incomplete response", stream.request_id.as_deref());
+            notify_incomplete_answer(
                 app,
+                wire_tx,
                 parsed.channel_id,
                 parsed.reply_to_event_id.as_deref(),
-                &owner_visible_error("incomplete response", stream.request_id.as_deref()),
+                &text,
                 epoch,
                 acp_session_id,
             )
@@ -802,11 +804,13 @@ async fn ensure_and_run(
         );
         if app.cfg.error_replies {
             // Do not make an unattended empty answer look like a successful turn.
-            let _ = post_error_reply(
+            let text = owner_visible_error("empty response", stream.request_id.as_deref());
+            notify_incomplete_answer(
                 app,
+                wire_tx,
                 parsed.channel_id,
                 parsed.reply_to_event_id.as_deref(),
-                &owner_visible_error("empty response", stream.request_id.as_deref()),
+                &text,
                 epoch,
                 acp_session_id,
             )
@@ -1169,6 +1173,34 @@ async fn post_error_reply(
     };
     let _ = relay.post_message(channel, text, reply_to).await?;
     Ok(())
+}
+
+async fn notify_incomplete_answer(
+    app: &App,
+    wire_tx: &WireSender,
+    channel_id: Option<Uuid>,
+    reply_to: Option<&str>,
+    text: &str,
+    epoch: u64,
+    acp_session_id: &str,
+) {
+    // ACP transcript and Buzz channel are separate audiences. Always notify
+    // ACP, and additionally publish the same safe text when a channel exists.
+    if epoch_is_current(app, acp_session_id, epoch).await {
+        wire::send(
+            wire_tx,
+            wire::session_update(
+                acp_session_id,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text }
+                }),
+            ),
+        )
+        .await;
+    }
+
+    let _ = post_error_reply(app, channel_id, reply_to, text, epoch, acp_session_id).await;
 }
 
 fn jitter_backoff() -> Duration {

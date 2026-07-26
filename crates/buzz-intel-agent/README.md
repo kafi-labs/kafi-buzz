@@ -75,5 +75,6 @@ usage; the turn counter is the honest bound available today.
 A successful answer requires a terminal SSE frame and non-whitespace response
 text. If the stream closes without `Done`, any accumulated partial text is
 discarded. Missing terminal frames and empty completed answers produce a safe,
-owner-visible platform error (including the request id when available) instead
-of publishing a partial or silently ending the turn.
+owner-visible platform error (including the request id when available) in the
+ACP transcript and, when a channel exists, in the Buzz channel instead of
+publishing a partial or silently ending the turn.

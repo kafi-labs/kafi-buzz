@@ -594,6 +594,62 @@ async fn e2e_done_with_empty_or_whitespace_response_posts_safe_error() {
 }
 
 #[tokio::test]
+async fn e2e_channel_less_incomplete_response_notifies_acp_client() {
+    let (gateway, st) = spawn_gateway(Scenario::CleanEofAfterPartialResponse).await;
+    let mut h = Harness::spawn_with_env(
+        &gateway,
+        &[
+            ("INTEL_SSE_IDLE_TIMEOUT_SECS", "2"),
+            ("INTEL_TURN_TIMEOUT_SECS", "5"),
+        ],
+    )
+    .await;
+    h.initialize().await;
+    let sid = h.session_new().await;
+
+    let (reason, updates) = tokio::time::timeout(
+        Duration::from_secs(6),
+        h.prompt(&sid, "direct ACP prompt without Buzz channel metadata"),
+    )
+    .await
+    .expect("channel-less incomplete response hung past the configured turn bound");
+    assert_eq!(reason, "end_turn");
+
+    let message_texts: Vec<&str> = updates
+        .iter()
+        .filter(|update| {
+            update
+                .pointer("/params/update/sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("agent_message_chunk")
+        })
+        .filter_map(|update| {
+            update
+                .pointer("/params/update/content/text")
+                .and_then(Value::as_str)
+        })
+        .collect();
+    assert_eq!(
+        message_texts,
+        vec!["⚠️ Intel platform error (incomplete response; request id: test-rid)"],
+        "channel-less ACP transcript must contain the safe error and no partial answer"
+    );
+    assert!(
+        message_texts
+            .iter()
+            .all(|text| !text.contains("PARTIAL-CFO-NUMBER-742")),
+        "partial answer must not be presented as complete: {message_texts:?}"
+    );
+    assert_eq!(
+        st.relay_posts.load(Ordering::SeqCst),
+        0,
+        "a channel-less prompt has no relay destination"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
 async fn e2e_happy_path_multi_frame_and_one_session_per_channel() {
     let (gateway, st) = spawn_gateway(Scenario::HappyMultiFrame).await;
     let mut h = Harness::spawn(&gateway).await;
