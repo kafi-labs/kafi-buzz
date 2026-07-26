@@ -2793,3 +2793,58 @@ boundary confirmed by `grep -c RuntimeAgentNameField AgentConfigFields.tsx` → 
 creating, select when editing, and correct fields in global defaults. Remaining from the original
 request: the **web** console, which is a real build rather than wiring — `web/` has relay and signing
 primitives but no publish path (D-L89).
+
+---
+
+## Iteration 20 — the web console has a hard prerequisite nobody has named
+
+**D-L99 — STOP-AND-REPORT: a web intel console cannot configure credentials. Not "unbuilt" —
+architecturally cannot, as the system is designed today.**
+
+I was about to start the last piece of the original ask ("web based … configure intelligence
+platform"). Assessing first — the habit that has repeatedly prevented building the wrong thing —
+turned up a blocker that is not a matter of effort.
+
+**What is published to the relay, and what is not:**
+
+| State | Storage | Published? |
+|---|---|---|
+| Persona definitions (kind 30175) | relay + disk | **yes** (`persona_events.rs`) |
+| Teams (kind 30176) | relay + disk | **yes** (`event_sync.rs`) |
+| Managed agents (kind 30177) | `managed-agents.json` | backfilled elsewhere, not in the teams path |
+| **Global agent config** | `<app-data>/agents/global-agent-config.json`, `0o600` | **never** — grep finds it in no publish path |
+| **`env_vars` (holds `INTEL_API_KEY`)** | machine-local, `0o600` | **deliberately excluded** |
+
+The exclusion is explicit and intentional, not an oversight —
+`persona_events.rs:401`: *"Env vars are **deliberately absent**"*; `:427`: *"Env vars are not part of
+the snapshot"*; `:193` deserializes them as an empty map.
+
+**That is correct security design.** A Nostr relay is a broadcast store; publishing an
+`intel_*` bearer token there would expose it to every subscriber. Whoever wrote that comment was
+right, and nothing about a web console should change it.
+
+**But it means the ask, as stated, has an unsolved prerequisite.** A browser client cannot read a
+key that lives only on another machine's disk and is deliberately never transmitted. The options are
+all design decisions, not implementation work:
+
+| Option | Cost |
+|---|---|
+| **Server-side credential custody** — a component holds the gateway key and proxies roster/turn calls | real service to build, operate and secure; this is precisely what `kafi-signer` was spiked for with Nostr keys |
+| **Session-only entry** — the user pastes the key into the browser each session, kept in memory, never persisted | no custody problem; user re-enters every session and cannot save a workspace default |
+| **Read-only web console** — browse personas/agents from relay events, configure nowhere | genuinely useful and cheap, but is not "configure intelligence platform" |
+
+**I am not choosing among these.** Each commits the product to a different security posture, and the
+first one is a service with an operational burden. That is a decision, not a task — the same line I
+drew at D-L98 over the global-defaults picker, and the same one that kept me from touching
+`BUZZ_AUTH_TAG`.
+
+**Why this is worth more than a partial build.** Had I started the web console from the desktop's
+shape, I would have written a config form, wired it to a publish path, and discovered at the end
+either that the key could not be supplied or — worse — published a secret to the relay to make the
+form work. The assessment cost one iteration; the wrong build would have cost several and produced a
+security defect.
+
+**Note the precedent in the user's own work:** `~/project/kafi/kafi-signer/` exists as a spike for
+exactly this shape of problem — custodial secrets so a browser can act without holding them. Its
+README already records the honest cost ("the operator can sign as any user") and its open question
+(custodial vs NIP-46). Whatever is decided here should be decided alongside that, not separately.
