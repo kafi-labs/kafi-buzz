@@ -2199,3 +2199,60 @@ re-provisioning means changing `BUZZ_AUTH_TAG` on production. What has changed i
 now de-risked: this run is a working template — generate keypair, compute auth tag, persist at 0600,
 verify a real answer — executed successfully end to end. If the user says go, it is a known
 procedure rather than an experiment.
+
+---
+
+**D-L83 — Two artifacts that claimed a memory guarantee they did not provide.**
+
+Both found by *checking* rather than recalling, per D-L79. Fixed in `5a14f361`.
+
+**1. `evict_expired_at` was dead code wearing a safety badge.** Defined at `quota.rs:160`; its only
+call sites were `quota.rs:340` and `:343`, both inside `mod tests` (which begins at line 193). No
+production path ever called it.
+
+This is worse than an unimplemented feature. A **public** method named `evict_expired_at`, with
+passing unit tests beside it, tells any reviewer — including future me — that expiry eviction is
+handled. The `windows` map grew for process lifetime regardless. It is the same failure class as the
+README that asserted the quota bypass was closed (D-L67): **an artifact whose existence implies a
+property it does not deliver.** Dead code that looks like protection is more dangerous than absent
+code, because absent code prompts the question.
+
+Now called from `check_and_record_at`, which already holds `&mut self` under the caller's mutex — no
+new lock, timer, or background task. The O(n) scan per admission is self-limiting: `n` is the count
+of tracked scopes, and the scan reclaims stale entries exactly when accumulation makes it worth
+paying for. Semantics unchanged, and the evidence for that is that the **pre-existing** window tests
+pass unmodified — evicting an elapsed entry and resetting one yield the same count, so
+`window_resets_after_it_elapses` still holds.
+
+**2. The SSE buffer cap undercounted real memory by ~25×.** `SSE_BUFFER_CAP` is 8 MB and
+`data_bytes` accumulated only line *content* length, but `data_lines` is a `Vec<String>` and each
+`String` carries ptr/len/cap overhead the cap never counted. A stream of 1-byte `data:` lines charged
+~1 byte each while consuming ~25 — so an 8 MB cap could admit on the order of **200 MB**, while its
+own doc comment claimed to bound memory *"under adversarial streams."* The comment was not aspirational
+sloppiness; it was the precise thing a reader would rely on when reasoning about a hostile gateway.
+
+Accounting now charges `size_of::<String>()` per retained line — **computed, not hardcoded 24**, so
+it stays correct on other targets. `SSE_BUFFER_CAP` keeps its exact value; only the accounting moved.
+
+**The detail I most approve of in the fix:** the corrected doc comment states what *is* counted and
+remains explicit that allocator bookkeeping and unused `Vec` capacity are **not**. It would have been
+easy to now claim the cap is exact. It isn't — it is much closer, and saying so is what keeps the
+comment from becoming the next load-bearing lie.
+
+**A pattern across D-L67, D-L78 and both halves of D-L83.** Four times now the defect was not broken
+logic but a **confident artifact misdescribing reality**: a README asserting the inverse of the
+behaviour, a health-check suite that only measured installability, a method name promising eviction
+that never ran, and a cap comment promising a memory bound it did not enforce. Every one passed
+review precisely *because* it looked deliberate. The generalisation worth carrying: **when auditing a
+safety property, verify it at the call site, never from the name, the comment, or the test that sits
+beside it.**
+
+Verified by me: eviction call site at `quota.rs:122` (production — `mod tests` now starts at 198),
+`size_of::<String>()` present at `intel.rs:481`, cap still `8 * 1024 * 1024`, 63 unit (was 61) + 14
+e2e pass, clippy `--all-targets -D warnings` clean, fmt clean, only the two files touched.
+
+**Not deployed.** wren is unreachable (D-L78) so a deploy could not be functionally verified there,
+and these two fixes change no behaviour a well-formed stream exercises. Deploying to prove nothing,
+on a production agent nobody can talk to, would be motion rather than progress — the D-L68
+drift-avoidance argument does not stretch this far. They ship with the wren repair, whenever the
+user decides it.
