@@ -1596,3 +1596,67 @@ without writing its report file, and its pane is too narrow to recover output fr
 SSE frames, streams that end with no terminal frame, and multi-byte UTF-8 split across chunk
 boundaries — the last one directly on the proven Indonesian+emoji path — remain **unexamined**.
 That is an open gap, not a clean bill of health.
+
+---
+
+**D-L67 — The bypass fix shipped, and the README was worse than the bug.**
+
+Fix committed as `6d1fbf82`. The implementation came back better than I specified: I asked for
+`None` to be passed instead of the per-session key, and it also **deleted the `acp_session_id`
+parameter from `quota_scope_key` entirely**. That converts "we don't do the wrong thing" into
+"the wrong thing is unreachable" — the function no longer has access to the value it would need
+to reintroduce the bug. Worth naming as a pattern: *remove the capability, not just the call.*
+
+Verified by me rather than by report — 61 unit + 10 e2e pass, `clippy --all-targets -D warnings`
+clean, `fmt` clean, exactly three files touched. The TDD red proof was genuine:
+`left: "end_turn"` / `right: "refusal"`, i.e. the second ACP session really did receive a fresh
+budget before the fix.
+
+**One predicate needed care.** `rg 'acp:\{'` still matched two lines after the fix
+(`acp.rs:1032,1039`). Those are in `session_mapping_key`, which maps ACP sessions to intel
+sessions for **cross-session memory** — an unrelated concern where per-session keying is correct
+and deliberate. A careless reading of my own acceptance predicate would have called this a
+failed fix. Predicates need to name the *function*, not just the string.
+
+**The documentation was the worst part of this finding.** The old README said:
+
+> When a prompt carries no channel the ACP session id is used instead, so a harness session
+> cannot bypass the budget by omitting the channel.
+
+It asserted the **exact inverse** of the behaviour. That is strictly worse than saying nothing:
+anyone auditing the cost controls would have read that sentence, concluded the hole was closed,
+and stopped looking. Two further inaccuracies in the same table are corrected too (the limit
+bounds admitted logical turns, not gateway operations; a turn that fails after admission still
+consumes its slot).
+
+**Generalisation:** a confident wrong doc is a load-bearing lie. The quota had three defects —
+the bypass, the amplification, and the failure-charging — and the README's confident phrasing
+was the reason none of them were obvious. When auditing a safety control, read the code before
+the doc that claims it works.
+
+---
+
+**D-L68 — Why I deployed a fix that changes nothing for the live path.**
+
+I nearly did not deploy this. The honest case against: on wren the harness receives Buzz channel
+messages, which always carry `channel_id`, so the channel-less branch is **never taken in
+production today**. The fix is a no-op for the live traffic, while deploying costs a restart —
+and restarting resets the in-memory quota (D-L66 #1), plus I have already caused one production
+incident by touching this agent (D-L52).
+
+I deployed anyway, for one reason: **letting the deployed binary drift from the reviewed branch
+is the exact failure the drift checker exists to catch.** `scripts/check-deployed-drift.sh` was
+built precisely because "which build is actually live?" became unanswerable once. Choosing not
+to deploy would trade a known, bounded, documented consequence (a quota window reset) for an
+unbounded one (an unreviewed divergence I would have to reconstruct later).
+
+The restart consequence is stated in the brief as *expected and acceptable*, with an explicit
+instruction not to try to preserve the counter — because an attempt to be clever there is how
+the last incident started.
+
+**The incident lesson is now a mechanism, not a resolve.** The deploy brief forbids touching any
+`INTEL_*` value anywhere, names `run-harness.sh` specifically as the one whose `export` wins, and
+requires proving `120`/`3600` from `/proc/<pid>/environ` after the restart — with the instruction
+that a mismatch means *restore the backups and report the failure*, explicitly **not** "edit the
+config until it matches." Last time the failure was a worker changing a value and not restoring
+it; the fix is to make restoration the required response to a mismatch rather than repair.
