@@ -2642,3 +2642,42 @@ e2e**, workspace clippy clean, size guard exit 0, workspace fmt clean.
 | Roster lookup without chicken-and-egg | fixed `24e9116d` |
 | Global-default / edit surfaces | not started |
 | **Web** client console | not started — `web/` can read via existing primitives, has no publish path (D-L89) |
+
+---
+
+**D-L95 — The picker is verified against the LIVE gateway, not just mocks.**
+
+Every prior test of the roster path was a mock. Following the pattern that has paid off repeatedly
+in this log (D-L78, D-L82), I ran the real thing: a local debug build of `buzz-intel-agent`,
+`INTEL_GATEWAY_URL=https://intel-platform.exe.xyz`, credentials via `INTEL_API_KEY_FILE`, and
+**`INTEL_AGENT` deliberately unset**.
+
+| Link in the chain | Result |
+|---|---|
+| `--list-agents` with **no** `INTEL_AGENT` | **exit 0** — the `24e9116d` fix works live, not only in tests |
+| stderr | empty; no key material, no warnings |
+| Gateway response shape | `{agents: [...], total: 14}` |
+| Parser envelope handling (`intel_agent_roster.rs:161`) | accepts `agents` ✓ |
+| Live entry id field | **`agent_id`** — parser tries `agent_id` **then** `id`, so it resolves ✓ |
+| Required `name` / optional `description` | both present ✓ |
+| Roster returned | **14 agents**, incl. `builder-sandbox-build_19ccd48c1b8345f0-f822bd9c` |
+
+Two things this settles that mocks could not:
+
+1. **The credential split is real.** Before `24e9116d`, this exact invocation would have failed with
+   "INTEL_AGENT is required". Running it with the variable unset is the only way to prove the fix,
+   and it is the precise flow a first-time user hits — they have no agent name yet, which is *why*
+   they are opening the picker.
+2. **The parser matches the actual contract.** I expected a bug here: the live entries key their
+   identifier as `agent_id`, and a parser written against a guessed `id` would have silently
+   produced entries with no identifier. It tries `agent_id` first with an `id` fallback, so it is
+   correct — and correct for a reason nobody specified in my brief, which means the lane checked the
+   real contract rather than assuming one.
+
+**The name that justifies the whole feature:** `builder-sandbox-build_19ccd48c1b8345f0-f822bd9c`.
+That is what a user previously had to type by hand, exactly, into a free-text box, with no way to
+discover it. The picker is not a convenience over that; it is the difference between configurable
+and not.
+
+**Cleanup:** the fetched roster JSON was deleted after inspection rather than left in `/tmp` — it is
+org data, and only names and counts were ever printed.
