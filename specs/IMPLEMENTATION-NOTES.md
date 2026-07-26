@@ -1435,3 +1435,78 @@ incident stayed invisible. Prefer the check that cannot silently agree with itse
 **Housekeeping note:** `/opt/buzz-intel/run-harness.sh.bak-pre-quota-proof-20260726T080953Z`
 and two `bin/*.bak.*` pairs remain on the VM. Left deliberately — they are the forensic trail
 of the D-L52 incident and the native-binary swap. Worth deleting only when the VM is torn down.
+
+---
+
+## Iteration 8 — blindspot enumeration
+
+No `TODO.md` exists anywhere in the repo (checked), so this iteration took the other half of
+the standing instruction: hunt blindspots. I enumerated hypotheses, then **verified the two
+highest-stakes ones myself** rather than waiting on worker reports — a quota that can be raced
+is worthless, and worker self-reports have disagreed with artefacts in 4 of 5 dispatches.
+
+**D-L62 — GOOD NEWS, recorded so nobody "fixes" it: the quota is race-free.**
+
+Hypothesis was that `Mutex<TurnQuota>` might allow two concurrent turns to both consume the
+last slot (check and record as separate lock acquisitions). **REFUTED by the code** —
+`acp.rs:991-994`:
+
+```rust
+let decision = {
+    let mut quota = app.quota.lock().await;
+    quota.check_and_record_at(&key, std::time::Instant::now())
+};
+```
+
+Check and record are *one method call* under *one* lock acquisition, so concurrent turns
+serialise and exactly one wins the last slot. The lock is then released **before** the gateway
+call, which is also correct: holding it across the network round-trip would serialise every
+turn in the process globally and turn a per-scope quota into a global mutex.
+
+This is a non-issue, and no test needs writing for it. Recording it because the shape
+(`lock` → decision → release → expensive work) *looks* like a TOCTOU bug at a glance, and a
+future reader "hardening" it by widening the lock would cause a real performance regression
+while fixing nothing.
+
+**D-L63 — REAL FINDING: one quota turn can cost TWO gateway operations.**
+
+`enforce_turn_quota` is called at `acp.rs:531`, **outside** the retry loop that begins at
+`acp.rs:543`. Inside that loop (`acp.rs:563-569`):
+
+```rust
+Err(AdapterError::IntelSessionGone(msg)) if attempt < 2 => {
+    tracing::warn!("intel session gone ({msg}); recreating and retrying once");
+    let mut state = app.state.lock().await;
+    let _ = state.remove_session(&mapping_key);
+    continue;
+}
+```
+
+`ensure_and_run` both **creates a session and sends a message** — both billable. So on the
+session-gone path a single quota turn drives up to **2 session-creates + 2 message-sends**.
+It is *bounded* — `attempt < 2` caps it at exactly 2x, never unbounded — but it is neither
+documented nor tested.
+
+**Why this matters to the user, plainly:** the quota counts *logical turns, not gateway
+spend*. Setting `INTEL_MAX_TURNS_PER_WINDOW=120` does not cap gateway operations at 120.
+Combined with the already-known scope-key issue (D-L53, where one relay reached via two
+configured URLs yields two independent budgets), there are now **two distinct documented ways
+real spend exceeds the nominal limit**. Worst case on the live wren VM today: 120 turns × 2
+retries = 240 paid operations per hour per scope.
+
+**I am not changing this.** Retrying a genuinely-vanished session is the right behaviour, and
+refusing to retry would trade a cost bound for user-visible failures. But "the limit you set is
+not the ceiling you get" is exactly the kind of thing that should never be discovered from a
+bill. The honest options, for the user to pick:
+
+| Option | Effect | Cost |
+|---|---|---|
+| Leave as-is, document it | 1 turn ≤ 2 ops; ceiling is 2×N | free; the number in the env var is a factor of 2 off |
+| Move `enforce_turn_quota` inside the loop | retry consumes a second turn | a retry can now be refused, converting a recoverable blip into a failed turn |
+| Count gateway ops, not turns | env var means what it says | larger change; the counter stops matching the ACP notion of "turn" |
+
+My recommendation is the first — the 2x is bounded and retries are rare — **provided** the
+README states the ceiling is `2 × INTEL_MAX_TURNS_PER_WINDOW`, because right now it does not.
+
+**Also settled in passing:** the "does a stale persisted session recover?" question is answered
+by the same code — yes, it recreates and retries exactly once, then surfaces the error.
