@@ -1966,3 +1966,90 @@ Second, on honesty: the worker reported plainly that a first-try pass is a regre
 "not a bug fix or a new production discovery." That framing was requested, and it matters — a
 green test here is easy to present as a catch. The silent-success family is now fixed and pinned at
 four cases; claiming a fifth would be inventing work.
+
+---
+
+## Iteration 10 — the deployed agent cannot be spoken to
+
+**D-L78 — THE HEADLINE: wren's agent is running, healthy, authenticated… and unreachable by
+anyone. Every check I built says green.**
+
+I set out to close a gap I had created myself: across two deploys I verified *mechanics*
+exhaustively but never verified *function*. That mattered specifically because my own changes
+restructured the **success** path (`5f6c21ee` de-indented the entire reply-publishing block out of
+an `if !reply_text.is_empty()` wrapper; `b4978c05` added notification beside it), and both were
+verified only against mock E2E tests. A live success-path regression would leave every check green.
+
+Attempting that test found something worse than a regression.
+
+The agent runs with `respond_to=owner-only` and owner pubkey
+`f30ba55aac907850aa4cc7b4b52a46c47ddd173a5796197fa0765a34dacea6bf`, resolved from `BUZZ_AUTH_TAG`
+in `run-harness.sh`. **The secret key for that pubkey does not exist anywhere.** Searched
+independently, by me and by the worker:
+
+| Location | Contents |
+|---|---|
+| `/opt/buzz-intel/secrets/` on wren | **only** `intel-e2e.key` — the intel *gateway* API bearer, not a Nostr key |
+| `/opt/buzz-intel/bin/` | only `buzz-acp`, `buzz-intel-agent`, `.bak` copies — **no `buzz` CLI at all** |
+| `/home/exedev`, VM `/tmp` | nothing (worker checked) |
+| `~/.config/buzz/` | only `intel-e2e.key` |
+| buzz tree, `~/.buzz` | no `owner.sk`, `*owner*.sk`, `auth_tag.json`, `pubkeys.env` |
+
+So **no one can send this agent a message it will answer.** Not me, not the user. Minting a new
+owner identity would require changing `BUZZ_AUTH_TAG`, which is a config change and a decision that
+is not mine to make unasked.
+
+**How it was lost:** the iteration-5 live E2E genuinely passed (3/3 MUST scenarios, Indonesian +
+emoji multi-turn), so the owner key existed then. The bootstrap script generates keys into a
+`$SCRATCH` directory; that directory is gone. The capability disappeared silently and nothing
+noticed, because everything built afterwards checked installation rather than usability.
+
+**The uncomfortable part, and the real lesson.** I built an elaborate verification apparatus over
+nine iterations — build-to-process sha chain of custody, `/proc/<pid>/environ` reads to defeat the
+three-way config precedence trap, startup-journal readiness checks, a drift detector comparing
+deployed revision to local HEAD. Every one of those is sound. Every one of them passes right now.
+**Not one of them asks whether the thing can be used.** In D-L76 I even drew the distinction —
+"'the unit is active' is liveness; 'it authenticated and subscribed' is readiness" — and then
+treated readiness as the finish line. Readiness is not usability, and I wrote the sentence that
+should have told me so.
+
+`sha256(deployed) == sha256(built)` proves I shipped what I compiled. It says nothing about whether
+what I compiled can be reached. **A verification suite that only ever gets greener is measuring the
+wrong thing.**
+
+**Not fixed, because it is the user's call.** Two honest options:
+
+| Option | What it costs |
+|---|---|
+| Re-provision an owner identity: generate a keypair, recompute `BUZZ_AUTH_TAG` (the prebuilt `compute-auth-tag` from D-L67 now makes this cheap), persist the secret somewhere durable, restart | a config change + restart on production; gets a usable agent back |
+| Leave it | the deployment stays a correctly-installed demonstration that no one can talk to |
+
+If we re-provision, **the secret must land somewhere durable and be recorded in this log** — the
+whole failure was an ephemeral scratch directory holding the only copy of a production credential.
+
+---
+
+**D-L79 — My brief was wrong for the FOURTH time, and the mechanism I already wrote would have
+caught it.**
+
+I instructed the worker to "use the on-VM bundled `buzz` CLI" and to "locate the owner secret on
+the VM." Both false. The worker burned roughly twenty minutes on an impossible task before I
+checked the premises myself — and it correctly reported blocking rather than fabricating a result.
+
+D-L59 already stated the fix: *"any brief that pins a branch must quote the SHA I observed by
+running `git branch --show-current` in the target worktree while writing the brief — never recalled
+from earlier context."* I scoped that rule to **branch names only**. The identical failure mode
+applies to **paths, installed binaries, and available credentials**, and I asserted all three from
+the bootstrap script's *intent* rather than the VM's *state*. The script documents shipping an
+on-VM `buzz` CLI; that is what it was designed to do, not what is on this host today.
+
+**Widened rule:** any brief asserting a path, a binary, or a credential must quote the command that
+observed it — `ls`, `sha256sum`, `test -f` — run while writing the brief. Design documents and my
+own prior notes describe intent; only the host describes state.
+
+Worth recording that the worker's honesty held again: it reported "no channel message was sent, no
+config/service/binary changed," and disclosed the one artefact it did leave (a CLI copy at
+`/tmp/buzz-live-answer-probe`). I removed it and confirmed production untouched — PID `2795007`
+still active. Four of five recent dispatches have now reported blockers accurately; the pattern is
+that **checkable briefs produce honest reports**, and mine was checkable enough for the block to be
+the cheapest path.
