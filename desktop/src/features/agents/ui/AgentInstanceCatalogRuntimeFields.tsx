@@ -11,7 +11,10 @@ import {
 } from "./agentConfigOptions";
 import { RequiredFieldLabel } from "./agentConfigControls";
 import { PersonaProviderApiKeyField } from "./PersonaProviderApiKeyField";
-import { RuntimeAgentNameField } from "./RuntimeAgentNameField";
+import {
+  AGENT_INSTANCE_RUNTIME_FIELD_ID_PREFIX,
+  RuntimeAgentNameField,
+} from "./RuntimeAgentNameField";
 
 export type AgentInstanceFreeTextProviderField = Extract<
   AgentConfigFieldDescriptor,
@@ -185,6 +188,7 @@ export function AgentInstanceCatalogRuntimeFields({
           disabled={disabled}
           enabled={open}
           gatewayUrl={effectiveGatewayUrl}
+          idPrefix={AGENT_INSTANCE_RUNTIME_FIELD_ID_PREFIX}
           label={modelField.label}
           onValueChange={onModelChange}
           placeholder={

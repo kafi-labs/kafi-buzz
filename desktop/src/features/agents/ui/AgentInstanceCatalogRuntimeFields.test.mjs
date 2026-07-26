@@ -124,6 +124,7 @@ test("editing an intel instance renders the shared roster field and writes model
   );
   assert.equal(rosterField.props.gatewayUrl, "https://intel.example");
   assert.equal(rosterField.props.apiKey, "intel_effective");
+  assert.equal(rosterField.props.idPrefix, "edit-agent-runtime");
   rosterField.props.onValueChange("chosen-agent");
   assert.equal(model, "chosen-agent");
 });
@@ -136,6 +137,7 @@ test("editing an intel instance keeps free text when the roster fails", () => {
   const html = renderToStaticMarkup(
     React.createElement(IntelAgentRosterFieldView, {
       disabled: rosterField.props.disabled,
+      idPrefix: rosterField.props.idPrefix,
       onRetry: () => {},
       onValueChange: rosterField.props.onValueChange,
       placeholder: rosterField.props.placeholder,
@@ -147,7 +149,7 @@ test("editing an intel instance keeps free text when the roster fails", () => {
     }),
   );
 
-  assert.match(html, /persona-runtime-agent-name/);
+  assert.match(html, /edit-agent-runtime-agent-name/);
   assert.match(html, /Could not reach the Intelligence Platform gateway/);
   assert.match(html, /Retry/);
 });

@@ -7,6 +7,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { TauriInvokeError } from "@/shared/api/tauri";
 import { intelAgentRosterFailure } from "@/shared/api/intelAgentRoster";
 import {
+  AGENT_DEFINITION_RUNTIME_FIELD_ID_PREFIX,
+  AGENT_INSTANCE_RUNTIME_FIELD_ID_PREFIX,
   IntelAgentRosterFieldView,
   intelAgentRosterErrorState,
 } from "./RuntimeAgentNameField.tsx";
@@ -24,10 +26,11 @@ const agents = [
   },
 ];
 
-function render(state, value = "") {
+function render(state, value = "", idPrefix) {
   return renderToStaticMarkup(
     React.createElement(IntelAgentRosterFieldView, {
       disabled: false,
+      idPrefix,
       onRetry: () => {},
       onValueChange: () => {},
       placeholder: "INTEL_AGENT",
@@ -54,6 +57,30 @@ test("populated roster renders gateway agents and keeps manual entry", () => {
   assert.match(html, /builder-sandbox-build_19ccd48c1b8345f0-f822bd9c/);
   assert.match(html, /buzz-cfo-agent/);
   assert.match(html, /persona-runtime-agent-name/);
+});
+
+test("distinct call-site prefixes produce distinct field and status IDs", () => {
+  assert.notEqual(
+    AGENT_DEFINITION_RUNTIME_FIELD_ID_PREFIX,
+    AGENT_INSTANCE_RUNTIME_FIELD_ID_PREFIX,
+  );
+  const personaHtml = render(
+    { status: "populated", agents },
+    "",
+    AGENT_DEFINITION_RUNTIME_FIELD_ID_PREFIX,
+  );
+  const instanceHtml = render(
+    { status: "populated", agents },
+    "",
+    AGENT_INSTANCE_RUNTIME_FIELD_ID_PREFIX,
+  );
+
+  assert.match(personaHtml, /persona-runtime-agent-roster/);
+  assert.match(personaHtml, /persona-runtime-agent-name/);
+  assert.doesNotMatch(personaHtml, /edit-agent-runtime/);
+  assert.match(instanceHtml, /edit-agent-runtime-agent-roster/);
+  assert.match(instanceHtml, /edit-agent-runtime-agent-name/);
+  assert.doesNotMatch(instanceHtml, /persona-runtime/);
 });
 
 test("choosing a roster option writes the existing model value", () => {

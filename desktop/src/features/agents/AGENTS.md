@@ -100,12 +100,14 @@ with a TypeScript lookup table or an id comparison in a component.
    Edit. In Edit,
    selecting Custom command keeps its required command field beside the harness
    picker rather than hiding it in Advanced.
-10. **Provider-locked runtime fields stay catalog-driven across create and
-    instance edit.** Both surfaces derive free-text gateway/model fields and
-    runtime-owned secrets from `deriveAgentConfigFieldModel`; agent-name roster
-    behavior is shared through `RuntimeAgentNameField`, including its manual
-    fallback. Do not fork a second runtime-specific picker or infer these fields
-    from a hardcoded runtime id.
+10. **Provider-locked runtime fields stay catalog-driven across create,
+    instance edit, and global defaults.** All three surfaces derive free-text
+    gateway/model fields and runtime-owned secrets from
+    `deriveAgentConfigFieldModel`; create and instance edit share agent-name
+    roster behavior through `RuntimeAgentNameField`, including its manual
+    fallback. Global defaults intentionally remain free text because their
+    model value can be inherited across runtimes. Do not fork a second
+    runtime-specific picker or infer these fields from a hardcoded runtime id.
 
 ## The tests that enforce this
 
@@ -116,6 +118,9 @@ with a TypeScript lookup table or an id comparison in a component.
   `shouldRenderModelControl` (successful-empty omit vs failure keep). If this
   fails, you probably reintroduced a per-surface flag or conflated empty with
   failed discovery.
+- `ui/AgentConfigFields.runtimeModes.test.mjs` — provider-locked global
+  defaults render descriptor-owned gateway/API-key/agent fields while the
+  existing LLM-catalog provider/model controls remain unchanged.
 - `ui/usePersonaModelDiscovery.test.mjs` — `synthesizeEmptyDiscoveryStatus`,
   `isCacheableDiscoveryResponse`, `deriveModelDiscoveryPending`,
   `isSuccessfulEmptyDiscovery`. If the "reopen to retry" copy becomes inert

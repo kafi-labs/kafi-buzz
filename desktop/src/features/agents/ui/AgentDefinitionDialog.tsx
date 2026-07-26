@@ -77,7 +77,10 @@ import { useBakedBuildEnvKeysQuery, useRuntimeFileConfigQuery } from "../hooks";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentHarnessField } from "./AgentHarnessField";
-import { RuntimeAgentNameField } from "./RuntimeAgentNameField";
+import {
+  AGENT_DEFINITION_RUNTIME_FIELD_ID_PREFIX,
+  RuntimeAgentNameField,
+} from "./RuntimeAgentNameField";
 import {
   AgentAiConfigurationModeField,
   AgentCreateAiDefaultsSummary,
@@ -1056,6 +1059,7 @@ export function AgentDefinitionDialog({
                   disabled={isPending}
                   enabled={open && aiConfigurationMode === "custom"}
                   gatewayUrl={provider}
+                  idPrefix={AGENT_DEFINITION_RUNTIME_FIELD_ID_PREFIX}
                   label={freeTextModelField.label}
                   onValueChange={setModel}
                   placeholder={
