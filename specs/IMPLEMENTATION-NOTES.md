@@ -2681,3 +2681,60 @@ and not.
 
 **Cleanup:** the fetched roster JSON was deleted after inspection rather than left in `/tmp` — it is
 org data, and only names and counts were ever printed.
+
+---
+
+**D-L96 — An assessment that ADDED a target, and refuted me twice.**
+
+Before extending the picker I asked for a read-only survey rather than writing a fix brief from my
+own grepping — four briefs this loop carried false premises, so the prior was against my reading
+being right. It came back having corrected me on both counts:
+
+1. **I assumed global defaults should keep free text**, reasoning they had no coherent source for
+   gateway credentials. **Wrong.** The unsaved draft holds all three: gateway URL in
+   `config.provider`, API key in `config.env_vars[apiKeyEnvVar]`, agent in `config.model`
+   (`types.ts:1022-1030`, `AgentDefaultsEditor.tsx:77-89`). That surface is in scope, just not yet
+   built.
+2. **The top-priority gap was a surface I never enumerated** — `AgentInstanceEditDialog`. An agent
+   *created* with the picker fell back to generic free-text when *edited*. I had been comparing
+   create-vs-defaults and missed create-vs-edit entirely.
+
+Had I written the fix brief from my own reading I would have built the wrong thing twice: skipped
+global defaults for a bad reason, and never touched the edit dialog. **This is the first assessment
+in the loop that added work rather than pruning it**, and it is the strongest argument yet for
+surveying before briefing — the failure mode is not only doing unnecessary work, it is confidently
+doing the wrong necessary work.
+
+---
+
+**D-L97 — The lifecycle hole closed (`0088babe`), and a bug prevented rather than introduced.**
+
+Managed Agent → Edit Agent now derives gateway / agent-name / API-key controls from the runtime
+catalog and **reuses** `RuntimeAgentNameField`. One component, both dialogs — I was firm about reuse
+because two near-identical pickers drifting apart is precisely the misdescribing-artifact class this
+log has recorded six times.
+
+It used the dialog's existing snapshots rather than new state (`effectiveProvider`,
+`envVarsForDiscovery[apiKeyEnvVar]`, existing `model`/`setModel`), so there is no parallel
+persistence path, and required catalog values now participate in Save validity.
+
+**Free text and Retry remain, and this instance matters more than the create path.** If the create
+picker fails you can still type a name; being unable to *edit a running agent* is a corner with no
+way out. Same rule, sharper consequence.
+
+**The subtle part — a bug prevented, not fixed:** generic ACP model discovery and its model-clearing
+effect are disabled while the catalog fields own the model UI. Left enabled, a second hidden
+discovery path could have silently cleared a selected Intel agent slug. That would have surfaced to
+users as "my agent selection keeps resetting" — cheap to prevent, miserable to reproduce. I did not
+anticipate it; the lane did.
+
+Verified by me with the full gate set: `pnpm check` exit 0 (biome 1624 files, file-sizes, px-text,
+pubkey-truncation), **1626** desktop Rust tests, **3486** desktop JS tests, 0 failures, clippy
+`--all-targets -D warnings` clean, fmt clean.
+
+**Score on who caught what.** Across this loop my briefs contained the defect four times (D-L59,
+D-L74, D-L79, plus the D-L93 gate I skipped); the lanes caught traps my briefs missed three times
+(D-L84's closed-sender case, D-L92's inherited `INTEL_API_KEY_FILE`, and this discovery-effect
+clash). Worth stating plainly: **the executors have been more reliable than the instructions.** The
+mechanism that helped most was not tighter instructions but *checkable* ones — every brief that
+stated a verifiable acceptance predicate got either a correct result or an honest refusal.
