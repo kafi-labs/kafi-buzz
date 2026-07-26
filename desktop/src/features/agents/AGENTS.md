@@ -100,6 +100,12 @@ with a TypeScript lookup table or an id comparison in a component.
    Edit. In Edit,
    selecting Custom command keeps its required command field beside the harness
    picker rather than hiding it in Advanced.
+10. **Provider-locked runtime fields stay catalog-driven across create and
+    instance edit.** Both surfaces derive free-text gateway/model fields and
+    runtime-owned secrets from `deriveAgentConfigFieldModel`; agent-name roster
+    behavior is shared through `RuntimeAgentNameField`, including its manual
+    fallback. Do not fork a second runtime-specific picker or infer these fields
+    from a hardcoded runtime id.
 
 ## The tests that enforce this
 

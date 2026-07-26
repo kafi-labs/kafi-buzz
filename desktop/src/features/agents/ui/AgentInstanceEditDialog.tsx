@@ -38,8 +38,8 @@ import {
   NO_RUNTIME_DROPDOWN_VALUE,
   PERSONA_FIELD_CONTROL_CLASS,
   PERSONA_FIELD_SHELL_CLASS,
-  PERSONA_LABEL_OPTIONAL_CLASS,
   runtimeSupportsLlmProviderSelection,
+  runtimeUsesFreeTextProvider,
   shouldClearKnownModelForSelectionScope,
   sortPersonaRuntimes,
   type PersonaDropdownOption,
@@ -66,12 +66,10 @@ import { AgentCreationPreview } from "./AgentCreationPreview";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { useRequiredCredentialState } from "./useRequiredCredentialState";
 import { CreateAgentRespondToField } from "./RespondToField";
-import { PersonaDropdownField } from "./PersonaDropdownField";
 import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
 } from "./usePersonaModelDiscovery";
-import { PersonaProviderApiKeyField } from "./PersonaProviderApiKeyField";
 import {
   getBakedModelInheritLabel,
   getBakedProviderInheritLabel,
@@ -83,6 +81,13 @@ import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
+import {
+  AgentInstanceCatalogRuntimeFields,
+  deriveAgentInstanceCatalogFields,
+  hasAgentInstanceCatalogRuntimeFields,
+} from "./AgentInstanceCatalogRuntimeFields";
+import { AgentInstanceGenericProviderModelFields } from "./AgentInstanceGenericProviderModelFields";
+import { AgentInstanceRuntimeSelectorFields } from "./AgentInstanceRuntimeSelectorFields";
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
   duration: 0.18,
@@ -255,7 +260,10 @@ export function AgentInstanceEditDialog({
     const matched =
       runtimes.find((r) => r.command?.trim() === originalCommand) ??
       runtimes.find((r) => r.id === originalCommand);
-    return runtimeSupportsLlmProviderSelection(matched?.id ?? "");
+    return (
+      runtimeSupportsLlmProviderSelection(matched?.id ?? "") ||
+      runtimeUsesFreeTextProvider(matched)
+    );
   }, [runtimes, originalAgentCommand]);
 
   // The runtime id that will actually be active after submit. When inheriting,
@@ -298,9 +306,33 @@ export function AgentInstanceEditDialog({
 
   const llmProviderFieldVisible =
     runtimeSupportsLlmProviderSelection(prospectiveRuntimeId);
+  const prospectiveRuntime = React.useMemo(
+    () => runtimes.find((runtime) => runtime.id === prospectiveRuntimeId),
+    [prospectiveRuntimeId, runtimes],
+  );
+  const catalogRuntimeFields = React.useMemo(
+    () =>
+      deriveAgentInstanceCatalogFields({
+        envVars,
+        model,
+        provider,
+        runtime: prospectiveRuntime,
+        runtimeId: prospectiveRuntimeId,
+      }),
+    [envVars, model, prospectiveRuntime, prospectiveRuntimeId, provider],
+  );
+  const {
+    apiKeyField: catalogApiKeyField,
+    modelField: catalogModelField,
+    providerField: catalogProviderField,
+  } = catalogRuntimeFields;
+  const catalogRuntimeFieldsVisible =
+    hasAgentInstanceCatalogRuntimeFields(catalogRuntimeFields);
+  const providerValueFieldVisible =
+    llmProviderFieldVisible || catalogProviderField !== null;
 
   // One-shot focus: when the dialog opens from a card deep-link, scroll and
-  // focus the relevant field. The effect re-runs when `llmProviderFieldVisible`
+  // focus the relevant field. The effect re-runs when `providerValueFieldVisible`
   // changes so a provider-field focus request fires once the field materializes.
   const normalizedFieldFocusFiredRef = React.useRef(false);
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional — reset guard on these three; llmProviderFieldVisible drives the focus attempt below
@@ -316,7 +348,9 @@ export function AgentInstanceEditDialog({
 
     const targetId =
       initialFocus.field === "provider"
-        ? "edit-agent-llm-provider"
+        ? catalogProviderField
+          ? "edit-agent-runtime-provider-env"
+          : "edit-agent-llm-provider"
         : "edit-agent-model";
     const el = document.getElementById(targetId);
     if (!(el instanceof HTMLElement)) return;
@@ -329,7 +363,13 @@ export function AgentInstanceEditDialog({
     });
 
     return () => cancelAnimationFrame(id);
-  }, [open, initialFocus, agent.pubkey, llmProviderFieldVisible]);
+  }, [
+    open,
+    initialFocus,
+    agent.pubkey,
+    catalogProviderField,
+    providerValueFieldVisible,
+  ]);
 
   // Provider + env to PERSIST on submit — also fed to the credential gate so
   // gate, saved record, and spawn snapshot all agree on one resolved value.
@@ -400,6 +440,15 @@ export function AgentInstanceEditDialog({
   const effectiveProvider =
     (inheritedSubmission.provider ?? "").trim() ||
     inheritedProviderDefault.value;
+  const effectiveModel =
+    (inheritedSubmission.model ?? "").trim() || inheritedModelDefault.value;
+  const catalogApiKeyEnvVar =
+    catalogApiKeyField?.targetApplication.kind === "envVar"
+      ? catalogApiKeyField.targetApplication.key
+      : null;
+  const effectiveCatalogApiKey = catalogApiKeyEnvVar
+    ? (envVarsForDiscovery[catalogApiKeyEnvVar] ?? "")
+    : "";
   const providerForDiscovery = llmProviderFieldVisible ? effectiveProvider : "";
 
   const {
@@ -409,7 +458,7 @@ export function AgentInstanceEditDialog({
   } = usePersonaModelDiscovery({
     envVars: envVarsForDiscovery,
     isCustomProviderEditing,
-    modelFieldVisible: true,
+    modelFieldVisible: !catalogRuntimeFieldsVisible,
     open,
     provider: providerForDiscovery,
     selectedRuntime,
@@ -447,6 +496,7 @@ export function AgentInstanceEditDialog({
   React.useEffect(() => {
     if (
       !open ||
+      catalogRuntimeFieldsVisible ||
       isCustomModelEditing ||
       !shouldClearKnownModelForSelectionScope({
         model,
@@ -461,6 +511,7 @@ export function AgentInstanceEditDialog({
     setIsCustomModelEditing(false);
   }, [
     isCustomModelEditing,
+    catalogRuntimeFieldsVisible,
     model,
     open,
     providerForDiscovery,
@@ -568,12 +619,16 @@ export function AgentInstanceEditDialog({
   }
 
   const providerValid = isEditAgentProviderSaveValid({
-    llmProviderFieldVisible,
+    llmProviderFieldVisible: providerValueFieldVisible,
     currentProvider: provider,
     originalProvider: agent.provider,
     globalProvider: inheritedProviderDefault.value,
     originalRuntimeSupportsProvider,
   });
+  const catalogRuntimeFieldsValid =
+    (!catalogProviderField?.required || effectiveProvider.trim().length > 0) &&
+    (!catalogModelField?.required || effectiveModel.trim().length > 0) &&
+    (!catalogApiKeyField?.required || effectiveCatalogApiKey.trim().length > 0);
 
   const canSubmit =
     computeEditAgentFormValidity({
@@ -589,6 +644,7 @@ export function AgentInstanceEditDialog({
       requiredEnvKeyMissing,
     }) &&
     providerValid &&
+    catalogRuntimeFieldsValid &&
     !updateMutation.isPending &&
     !isAvatarUploadPending;
 
@@ -614,17 +670,18 @@ export function AgentInstanceEditDialog({
         agentCommandOverride: agent.agentCommandOverride ?? null,
       });
 
-      // Classify the effective post-submit runtime's provider capability as a
-      // tri-state: "capable" persists the provider, "locked" clears it (only
-      // when we KNOW it's provider-locked, e.g. Claude), "unknown" OMITS it so a
-      // transient/custom state never becomes a destructive write. Resolved
+      // Classify the effective post-submit runtime's provider-value capability
+      // as a tri-state: "capable" persists either an LLM provider or a
+      // catalog-declared free-text gateway, "locked" clears it only for
+      // runtimes with no provider value (e.g. Claude), and "unknown" OMITS it
+      // so a transient/custom state never becomes a destructive write. Resolved
       // STATICALLY (by id) so a not-yet-loaded catalog can't misclassify a known
       // runtime as "unknown" — see resolveRuntimeProviderCapability. The runtime
       // id is the shared prospectiveRuntimeId, so submit and the block-save gate
       // always agree on which runtime is being saved.
       const providerRuntimeCapability = resolveRuntimeProviderCapability(
         prospectiveRuntimeId,
-        runtimeSupportsLlmProviderSelection(prospectiveRuntimeId),
+        providerValueFieldVisible,
       );
 
       // Provider + env to persist — the shared inherited-submission snapshot
@@ -669,7 +726,8 @@ export function AgentInstanceEditDialog({
         //   "capable"  → persist: value if changed, omit if unchanged.
         //   "locked"   → clear: send null if provider was set, else omit.
         //   "unknown"  → omit always (never send null for a transient state).
-        // llmProviderFieldVisible is for UX visibility only; not used here.
+        // providerValueFieldVisible includes both LLM-provider selectors and
+        // catalog-declared free-text gateway fields.
         provider:
           providerRuntimeCapability === "capable"
             ? normalizedSubmitProvider !== (agent.provider ?? null)
@@ -917,185 +975,67 @@ export function AgentInstanceEditDialog({
               variant="persona"
             />
 
-            {/* Provider (runtime) */}
-            <div className="space-y-1.5">
-              <label
-                className="text-sm font-medium text-foreground"
-                htmlFor="edit-agent-runtime"
-              >
-                Provider
-              </label>
-              <PersonaDropdownField
+            <AgentInstanceRuntimeSelectorFields
+              agentCommand={agentCommand}
+              disabled={updateMutation.isPending}
+              inheritHarness={inheritHarness}
+              onAgentCommandChange={setAgentCommand}
+              onRuntimeChange={handleRuntimeDropdownChange}
+              runtimeDropdownOptions={runtimeDropdownOptions}
+              runtimeDropdownValue={runtimeDropdownValue}
+              selectedRuntime={selectedRuntime}
+              selectedRuntimeId={selectedRuntimeId}
+            />
+            {/* Provider-locked catalog fields include the shared
+                RuntimeAgentNameField roster picker and its manual fallback. */}
+            {catalogRuntimeFieldsVisible ? (
+              <AgentInstanceCatalogRuntimeFields
+                {...catalogRuntimeFields}
                 disabled={updateMutation.isPending}
-                id="edit-agent-runtime"
-                onValueChange={handleRuntimeDropdownChange}
-                options={runtimeDropdownOptions}
-                placeholder="Choose a provider"
-                value={runtimeDropdownValue}
-              />
-              {selectedRuntime ? (
-                <p className="text-xs text-muted-foreground">
-                  Detected at{" "}
-                  <span className="font-medium">
-                    {selectedRuntime.binaryPath ??
-                      selectedRuntime.command ??
-                      selectedRuntime.id}
-                  </span>
-                </p>
-              ) : null}
-            </div>
-            {selectedRuntimeId === "custom" && !inheritHarness ? (
-              <div className="space-y-1.5">
-                <label
-                  className="text-sm font-medium text-foreground"
-                  htmlFor="edit-agent-command"
-                >
-                  Agent command
-                </label>
-                <div
-                  className={cn(
-                    "flex min-h-11 items-center px-3",
-                    PERSONA_FIELD_SHELL_CLASS,
-                  )}
-                >
-                  <Input
-                    autoCorrect="off"
-                    className={cn(
-                      "h-8 px-0 py-0 leading-6",
-                      PERSONA_FIELD_CONTROL_CLASS,
-                    )}
-                    disabled={updateMutation.isPending}
-                    id="edit-agent-command"
-                    onChange={(event) => setAgentCommand(event.target.value)}
-                    placeholder="Full path or shell command"
-                    value={agentCommand}
-                  />
-                </div>
-              </div>
-            ) : null}
-            {/* LLM provider */}
-            {llmProviderFieldVisible ? (
-              <div className="space-y-1.5">
-                <label
-                  className="text-sm font-medium text-foreground"
-                  htmlFor="edit-agent-llm-provider"
-                >
-                  LLM provider
-                  {providerRequired ? (
-                    <span className="ml-1 text-destructive" aria-hidden="true">
-                      *
-                    </span>
-                  ) : (
-                    <span className={PERSONA_LABEL_OPTIONAL_CLASS}>
-                      Optional
-                    </span>
-                  )}
-                </label>
-                <PersonaDropdownField
-                  disabled={updateMutation.isPending}
-                  id="edit-agent-llm-provider"
-                  onValueChange={handleProviderDropdownChange}
-                  options={providerDropdownOptions}
-                  placeholder="Default (auto)"
-                  value={providerSelectValue}
-                />
-                {isCustomProviderEditing ? (
-                  <div
-                    className={cn(
-                      "mt-2 flex min-h-11 items-center px-3",
-                      PERSONA_FIELD_SHELL_CLASS,
-                    )}
-                  >
-                    <Input
-                      aria-label="Custom provider ID"
-                      autoCorrect="off"
-                      className={cn(
-                        "h-8 px-0 py-0 leading-6",
-                        PERSONA_FIELD_CONTROL_CLASS,
-                      )}
-                      disabled={updateMutation.isPending}
-                      id="edit-agent-custom-provider"
-                      onChange={(event) => setProvider(event.target.value)}
-                      placeholder="Custom provider ID"
-                      value={provider}
-                    />
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-
-            {llmProviderFieldVisible && topLevelSecretEnvVar ? (
-              <PersonaProviderApiKeyField
-                disabled={updateMutation.isPending}
-                isInherited={apiKeyIsInherited}
-                inheritedLabel={apiKeyInheritedLabel}
-                isRequired={apiKeyIsRequired}
-                label={
-                  effectiveProvider === "anthropic"
-                    ? "Anthropic API Key"
-                    : "OpenAI API Key"
-                }
-                onValueChange={(next) => {
-                  setEnvVars((prev) => ({
-                    ...prev,
-                    [topLevelSecretEnvVar]: next,
-                  }));
+                effectiveApiKey={effectiveCatalogApiKey}
+                effectiveGatewayUrl={effectiveProvider}
+                envVars={envVars}
+                model={model}
+                onEnvVarValueChange={(key, value) => {
+                  setEnvVars((previous) => ({ ...previous, [key]: value }));
                 }}
-                value={apiKeyValue}
+                onModelChange={setModel}
+                onProviderChange={setProvider}
+                open={open}
+                provider={provider}
+                runtimeId={prospectiveRuntimeId}
               />
-            ) : null}
-
-            {/* Model */}
-            <div className="space-y-1.5">
-              <label
-                className="text-sm font-medium text-foreground"
-                htmlFor="edit-agent-model"
-              >
-                Model
-                {modelRequired ? (
-                  <span className="ml-1 text-destructive" aria-hidden="true">
-                    *
-                  </span>
-                ) : (
-                  <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
-                )}
-              </label>
-              <PersonaDropdownField
-                disabled={updateMutation.isPending || modelDiscoveryLoading}
-                id="edit-agent-model"
-                onValueChange={handleModelDropdownChange}
-                options={modelDropdownOptions}
-                placeholder="Default model"
-                value={modelSelectValue}
+            ) : (
+              <AgentInstanceGenericProviderModelFields
+                apiKeyInheritedLabel={apiKeyInheritedLabel}
+                apiKeyIsInherited={apiKeyIsInherited}
+                apiKeyIsRequired={apiKeyIsRequired}
+                apiKeyValue={apiKeyValue}
+                disabled={updateMutation.isPending}
+                effectiveProvider={effectiveProvider}
+                isCustomProviderEditing={isCustomProviderEditing}
+                llmProviderFieldVisible={llmProviderFieldVisible}
+                model={model}
+                modelDiscoveryLoading={modelDiscoveryLoading}
+                modelDropdownOptions={modelDropdownOptions}
+                modelRequired={modelRequired}
+                modelSelectValue={modelSelectValue}
+                modelStatusMessage={modelStatusMessage}
+                onModelDropdownChange={handleModelDropdownChange}
+                onModelValueChange={setModel}
+                onProviderDropdownChange={handleProviderDropdownChange}
+                onProviderValueChange={setProvider}
+                onSecretValueChange={(key, value) => {
+                  setEnvVars((previous) => ({ ...previous, [key]: value }));
+                }}
+                provider={provider}
+                providerDropdownOptions={providerDropdownOptions}
+                providerRequired={providerRequired}
+                providerSelectValue={providerSelectValue}
+                showCustomModelInput={showCustomModelInput}
+                topLevelSecretEnvVar={topLevelSecretEnvVar}
               />
-              {showCustomModelInput ? (
-                <div
-                  className={cn(
-                    "mt-2 flex min-h-11 items-center px-3",
-                    PERSONA_FIELD_SHELL_CLASS,
-                  )}
-                >
-                  <Input
-                    aria-label="Custom model ID"
-                    autoCorrect="off"
-                    className={cn(
-                      "h-8 px-0 py-0 leading-6",
-                      PERSONA_FIELD_CONTROL_CLASS,
-                    )}
-                    disabled={updateMutation.isPending}
-                    id="edit-agent-custom-model"
-                    onChange={(event) => setModel(event.target.value)}
-                    placeholder="Custom model ID"
-                    value={model}
-                  />
-                </div>
-              ) : null}
-              {modelStatusMessage ? (
-                <p className="text-xs text-muted-foreground">
-                  {modelStatusMessage}
-                </p>
-              ) : null}
-            </div>
+            )}
 
             <AgentAiDefaultsNotice
               onEditDefaults={() => setAiDefaultsOpen(true)}
