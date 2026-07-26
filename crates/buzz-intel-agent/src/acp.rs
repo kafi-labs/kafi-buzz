@@ -269,7 +269,7 @@ async fn initialize(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSend
 
     // Fail-fast config: missing credentials surface as a clear JSON-RPC error
     // (process may start without them so the harness can display the message).
-    if let Err(e) = app.cfg.require_intel_credentials() {
+    if let Err(e) = app.cfg.require_acp_runtime_config() {
         tracing::error!("initialize failed (config): {e}");
         return reject(
             wire_tx,

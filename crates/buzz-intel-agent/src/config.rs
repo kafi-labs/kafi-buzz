@@ -233,8 +233,8 @@ impl Config {
     ///
     /// Missing `INTEL_GATEWAY_URL` / API key / `INTEL_AGENT` are allowed here so
     /// the ACP server can start and return a clear JSON-RPC error from
-    /// `initialize`. Call [`Config::require_intel_credentials`] for one-shot
-    /// modes (`--auth-probe`, `--list-agents`) and inside `initialize`.
+    /// `initialize`. One-shot modes call [`Config::require_gateway_credentials`];
+    /// ACP initialization calls [`Config::require_acp_runtime_config`].
     pub fn from_cli(cli: &Cli) -> Result<Self, AdapterError> {
         let gateway_url = cli
             .gateway_url
@@ -307,8 +307,8 @@ impl Config {
         })
     }
 
-    /// Fail if intel gateway credentials required for operation are missing.
-    pub fn require_intel_credentials(&self) -> Result<(), AdapterError> {
+    /// Fail if the gateway URL or API key required by one-shot gateway calls is missing.
+    pub fn require_gateway_credentials(&self) -> Result<(), AdapterError> {
         if self.gateway_url.is_empty() {
             return Err(AdapterError::Config(
                 "INTEL_GATEWAY_URL is required (or pass --gateway-url)".into(),
@@ -319,6 +319,12 @@ impl Config {
                 "INTEL_API_KEY or INTEL_API_KEY_FILE is required (or pass --api-key)".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Fail if gateway credentials or the agent required by ACP server mode are missing.
+    pub fn require_acp_runtime_config(&self) -> Result<(), AdapterError> {
+        self.require_gateway_credentials()?;
         if self.agent.is_empty() {
             return Err(AdapterError::Config(
                 "INTEL_AGENT is required (or pass --agent)".into(),
@@ -422,6 +428,22 @@ pub fn normalize_relay_url(url: &str) -> String {
 mod tests {
     use super::*;
 
+    fn config_for_mode(mode_flag: &str) -> Config {
+        let cli = Cli::try_parse_from([
+            "buzz-intel-agent",
+            "--gateway-url",
+            "https://intel.example.test",
+            "--api-key",
+            "intel_test_key",
+            mode_flag,
+        ])
+        .expect("mode CLI should parse");
+        let mut cfg = Config::from_cli(&cli).expect("mode config should resolve");
+        // Keep the tests hermetic even if the test runner exports INTEL_AGENT.
+        cfg.agent.clear();
+        cfg
+    }
+
     #[test]
     fn normalize_ws_to_http() {
         assert_eq!(
@@ -439,5 +461,66 @@ mod tests {
         assert_eq!(SessionMode::parse("channel").unwrap(), SessionMode::Channel);
         assert_eq!(SessionMode::parse("acp").unwrap(), SessionMode::Acp);
         assert!(SessionMode::parse("nope").is_err());
+    }
+
+    #[test]
+    fn list_agents_mode_accepts_gateway_credentials_without_agent() {
+        let cfg = config_for_mode("--list-agents");
+
+        cfg.require_gateway_credentials()
+            .expect("listing agents must not require an agent selection");
+    }
+
+    #[test]
+    fn auth_probe_mode_accepts_gateway_credentials_without_agent() {
+        let cfg = config_for_mode("--auth-probe");
+
+        cfg.require_gateway_credentials()
+            .expect("auth probe must not require an agent selection");
+    }
+
+    #[test]
+    fn acp_server_mode_still_requires_agent() {
+        let cli = Cli::try_parse_from([
+            "buzz-intel-agent",
+            "--gateway-url",
+            "https://intel.example.test",
+            "--api-key",
+            "intel_test_key",
+        ])
+        .expect("ACP server CLI should parse");
+        let mut cfg = Config::from_cli(&cli).expect("ACP server config should resolve");
+        cfg.agent.clear();
+
+        let error = cfg
+            .require_acp_runtime_config()
+            .expect_err("ACP server mode must require an agent");
+        assert_eq!(
+            error.to_string(),
+            "config: INTEL_AGENT is required (or pass --agent)"
+        );
+    }
+
+    #[test]
+    fn gateway_credential_errors_remain_specific() {
+        let mut cfg = config_for_mode("--list-agents");
+        cfg.gateway_url.clear();
+        let missing_url = cfg
+            .require_gateway_credentials()
+            .expect_err("missing gateway URL must fail");
+        assert_eq!(
+            missing_url.to_string(),
+            "config: INTEL_GATEWAY_URL is required (or pass --gateway-url)"
+        );
+
+        cfg.gateway_url = "https://intel.example.test".to_owned();
+        cfg.api_key.clear();
+        let missing_key = cfg
+            .require_gateway_credentials()
+            .expect_err("missing API key must fail");
+        assert_eq!(
+            missing_key.to_string(),
+            "config: INTEL_API_KEY or INTEL_API_KEY_FILE is required (or pass --api-key)"
+        );
     }
 }

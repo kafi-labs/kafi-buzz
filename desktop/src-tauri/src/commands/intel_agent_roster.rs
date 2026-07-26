@@ -122,8 +122,8 @@ fn build_roster_command(binary: &Path, gateway_url: &str, api_key: &str) -> std:
         // File credentials take precedence in buzz-intel-agent. Remove an
         // inherited file path so the unsaved form value is authoritative.
         .env_remove("INTEL_API_KEY_FILE")
-        // Config currently validates INTEL_AGENT before entering one-shot
-        // list mode even though the lookup itself does not use an agent.
+        // Backward compatibility: older adapter binaries require INTEL_AGENT
+        // even in one-shot list mode, and desktop may resolve one from PATH.
         .env("INTEL_AGENT", INTEL_ROSTER_AGENT_PLACEHOLDER)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

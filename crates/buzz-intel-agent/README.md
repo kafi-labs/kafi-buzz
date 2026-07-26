@@ -33,6 +33,9 @@ All settings are env-first; CLI flags mirror them. Required: `INTEL_GATEWAY_URL`
 `INTEL_API_KEY` (or `INTEL_API_KEY_FILE`), `INTEL_AGENT`. Injected by the harness:
 `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`.
 
+`--auth-probe` and `--list-agents` require only the gateway URL and API key;
+ACP server mode also requires `INTEL_AGENT`.
+
 ### LLM turn quota (cost bound)
 
 | Env | Default | Meaning |

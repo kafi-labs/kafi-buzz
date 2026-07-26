@@ -30,16 +30,16 @@ use crate::intel::IntelClient;
 pub async fn run() -> Result<(), AdapterError> {
     let cli = Cli::parse();
 
-    // Missing intel credentials are allowed for the ACP server path so
-    // `initialize` can return a JSON-RPC error; one-shot modes still require them.
+    // Missing intel config is allowed for the ACP server path so `initialize`
+    // can return a JSON-RPC error; one-shot modes require only gateway credentials.
     let cfg = Config::from_cli(&cli)?;
 
     if cli.auth_probe {
-        cfg.require_intel_credentials()?;
+        cfg.require_gateway_credentials()?;
         return auth_probe(&cfg).await;
     }
     if cli.list_agents {
-        cfg.require_intel_credentials()?;
+        cfg.require_gateway_credentials()?;
         return list_agents(&cfg).await;
     }
 
