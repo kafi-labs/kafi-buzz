@@ -498,14 +498,14 @@ fn non_persona_agent_never_drifts() {
     assert!(!orphaned);
 }
 
-use super::runtime_metadata_env_vars;
+use super::{apply_runtime_metadata_env, runtime_metadata_env_vars};
 
 #[test]
 fn runtime_metadata_env_vars_injects_model_and_provider() {
     let vars = runtime_metadata_env_vars(
         Some("GOOSE_MODEL"),
         Some("GOOSE_PROVIDER"),
-        false,
+        true,
         Some("gpt-4o"),
         Some("openai"),
     );
@@ -516,15 +516,41 @@ fn runtime_metadata_env_vars_injects_model_and_provider() {
 }
 
 #[test]
-fn runtime_metadata_env_vars_skips_provider_when_locked() {
+fn runtime_metadata_env_vars_skips_provider_when_injection_is_disabled() {
+    let claude = known_acp_runtime("claude").expect("claude runtime must be registered");
+    assert!(claude.provider_locked);
+    assert!(!claude.inject_provider_env);
+
     let vars = runtime_metadata_env_vars(
-        None, // claude has no model_env_var
-        None, // claude has no provider_env_var
-        true, // provider_locked = true
+        claude.model_env_var,
+        // Claude currently has no provider env key. Use a sentinel to prove
+        // the independent injection flag, rather than passing vacuously on None.
+        Some("CLAUDE_PROVIDER"),
+        claude.inject_provider_env,
         Some("claude-opus-4-7"),
         Some("anthropic"),
     );
     assert!(vars.is_empty());
+}
+
+#[test]
+fn intel_runtime_metadata_injects_gateway_url_into_child_command() {
+    let intel = known_acp_runtime("intel").expect("intel runtime must be registered");
+    let gateway_url = "https://intel.example.test";
+    let mut command = std::process::Command::new("buzz-intel-agent");
+
+    apply_runtime_metadata_env(
+        &mut command,
+        intel,
+        Some("buzz-cfo-agent"),
+        Some(gateway_url),
+    );
+
+    let injected_gateway = command
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new("INTEL_GATEWAY_URL"))
+        .and_then(|(_, value)| value);
+    assert_eq!(injected_gateway, Some(std::ffi::OsStr::new(gateway_url)));
 }
 
 #[test]
@@ -534,7 +560,7 @@ fn runtime_metadata_env_vars_injects_model_even_with_acp_model_switching() {
     let vars = runtime_metadata_env_vars(
         Some("BUZZ_AGENT_MODEL"),
         Some("BUZZ_AGENT_PROVIDER"),
-        false,
+        true,
         Some("goose-claude-4-6-opus"),
         Some("databricks"),
     );

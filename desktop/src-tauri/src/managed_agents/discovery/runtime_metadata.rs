@@ -38,7 +38,12 @@ pub(crate) struct KnownAcpRuntime {
     pub supports_acp_model_switching: bool,
     pub model_env_var: Option<&'static str>,
     pub provider_env_var: Option<&'static str>,
+    /// Whether the UI suppresses the generic LLM provider catalog for this runtime.
+    /// This does not control whether `provider_env_var` is injected into the child.
     pub provider_locked: bool,
+    /// Whether the effective provider is injected through `provider_env_var`.
+    /// This does not control whether the UI offers a provider catalog.
+    pub inject_provider_env: bool,
     pub default_env: &'static [(&'static str, &'static str)],
     pub config_file_path: Option<&'static str>,
     #[allow(dead_code)] // reserved for format-based dispatch when readers are unified

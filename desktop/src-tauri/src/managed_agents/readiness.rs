@@ -110,7 +110,7 @@ pub(crate) fn resolve_effective_agent_env(
         for (key, value) in super::runtime::runtime_metadata_env_vars(
             rt.model_env_var,
             rt.provider_env_var,
-            rt.provider_locked,
+            rt.inject_provider_env,
             effective_model,
             effective_provider,
         ) {
@@ -879,6 +879,7 @@ mod tests {
             model_env_var: None,
             provider_env_var: None,
             provider_locked: false,
+            inject_provider_env: true,
             default_env: &[],
             supports_acp_native_config: false,
             thinking_env_var: None,
@@ -1074,6 +1075,7 @@ mod tests {
             model_env_var: None,
             provider_env_var: None,
             provider_locked: false,
+            inject_provider_env: true,
             default_env: &[],
             supports_acp_native_config: false,
             thinking_env_var: None,

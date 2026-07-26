@@ -1899,15 +1899,7 @@ pub fn spawn_agent_child(
     // Written FIRST so that record/persona metadata env vars below override them.
     build_buzz_agent_provider_defaults(&mut command);
     if let Some(meta) = runtime_meta {
-        for (key, value) in runtime_metadata_env_vars(
-            meta.model_env_var,
-            meta.provider_env_var,
-            meta.provider_locked,
-            effective_model,
-            effective_provider,
-        ) {
-            command.env(key, value);
-        }
+        apply_runtime_metadata_env(&mut command, meta, effective_model, effective_provider);
     }
     command.env_remove("BUZZ_ACP_PRIVATE_KEY");
     command.env_remove("BUZZ_ACP_API_TOKEN");
@@ -2156,13 +2148,12 @@ pub fn start_managed_agent_process(
 /// agent process for model and provider selection.
 ///
 /// Model injection is unconditional — even agents that support ACP model
-/// switching need the initial bootstrap value. Provider injection is skipped
-/// when `provider_locked` is true (e.g. Claude runtimes that only work with
-/// Anthropic).
+/// switching need the initial bootstrap value. Provider injection is controlled
+/// independently from the UI's provider-catalog lock.
 pub(crate) fn runtime_metadata_env_vars<'a>(
     model_env_var: Option<&'a str>,
     provider_env_var: Option<&'a str>,
-    provider_locked: bool,
+    inject_provider_env: bool,
     effective_model: Option<&'a str>,
     effective_provider: Option<&'a str>,
 ) -> Vec<(&'a str, &'a str)> {
@@ -2170,12 +2161,30 @@ pub(crate) fn runtime_metadata_env_vars<'a>(
     if let (Some(env_key), Some(model)) = (model_env_var, effective_model) {
         vars.push((env_key, model));
     }
-    if !provider_locked {
+    if inject_provider_env {
         if let (Some(env_key), Some(provider)) = (provider_env_var, effective_provider) {
             vars.push((env_key, provider));
         }
     }
     vars
+}
+
+/// Applies runtime-specific model and provider metadata to the actual child command.
+pub(crate) fn apply_runtime_metadata_env(
+    command: &mut std::process::Command,
+    runtime: &KnownAcpRuntime,
+    effective_model: Option<&str>,
+    effective_provider: Option<&str>,
+) {
+    for (key, value) in runtime_metadata_env_vars(
+        runtime.model_env_var,
+        runtime.provider_env_var,
+        runtime.inject_provider_env,
+        effective_model,
+        effective_provider,
+    ) {
+        command.env(key, value);
+    }
 }
 
 /// Resolve the effective (prompt, model, provider) triple for a persona-linked agent.

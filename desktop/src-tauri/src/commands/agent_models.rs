@@ -146,7 +146,7 @@ fn saved_agent_model_discovery_config(
         for (key, value) in crate::managed_agents::runtime_metadata_env_vars(
             meta.model_env_var,
             meta.provider_env_var,
-            meta.provider_locked,
+            meta.inject_provider_env,
             record.model.as_deref(),
             record.provider.as_deref(),
         ) {
@@ -212,7 +212,7 @@ pub async fn discover_agent_models(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if !meta.provider_locked {
+        if meta.inject_provider_env {
             if let (Some(env_key), Some(provider)) = (meta.provider_env_var, provider) {
                 derived_env.insert(env_key.to_string(), provider.to_string());
             }

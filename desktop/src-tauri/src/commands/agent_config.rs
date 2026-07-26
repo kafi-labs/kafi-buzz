@@ -622,6 +622,7 @@ mod tests {
             model_env_var: Some("GOOSE_MODEL"),
             provider_env_var: Some("GOOSE_PROVIDER"),
             provider_locked: false,
+            inject_provider_env: true,
             default_env: &[],
             config_file_path: Some("~/.config/goose/config.yaml"),
             config_file_format: Some("yaml"),

@@ -1090,7 +1090,11 @@ fn intel_runtime_is_discoverable_with_expected_metadata() {
     assert_eq!(intel.provider_env_var, Some("INTEL_GATEWAY_URL"));
     assert!(
         intel.provider_locked,
-        "intel gateway is fixed per agent; provider must be locked"
+        "intel must suppress the generic LLM provider catalog"
+    );
+    assert!(
+        intel.inject_provider_env,
+        "intel must inject its configured gateway URL into the child"
     );
     assert_eq!(
         intel.required_normalized_fields,
