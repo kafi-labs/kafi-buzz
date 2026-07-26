@@ -299,13 +299,22 @@ impl IntelClient {
 
         let mut stream = resp.bytes_stream();
         let mut parser = SseByteParser::new();
+        let mut cancel = cancel.clone();
 
         loop {
             if *cancel.borrow() {
                 return Err(AdapterError::Cancelled);
             }
 
-            let next = tokio::time::timeout(self.sse_idle, stream.next()).await;
+            let next = tokio::select! {
+                next = tokio::time::timeout(self.sse_idle, stream.next()) => next,
+                _ = wait_for_cancel(&mut cancel) => {
+                    // The gateway has no turn-abort API. Dropping our read improves
+                    // user-visible latency and releases local resources, but the
+                    // gateway may keep generating and billing the request.
+                    return Err(AdapterError::Cancelled);
+                }
+            };
             let chunk = match next {
                 Ok(Some(Ok(bytes))) => bytes,
                 Ok(Some(Err(e))) => {
@@ -353,6 +362,19 @@ impl IntelClient {
         }
 
         Ok(result)
+    }
+}
+
+async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow() {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            // A closed sender with a false value is not a cancellation signal.
+            // Stay pending so the stream read or its idle timeout remains active.
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -1004,6 +1026,85 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains('\u{FFFD}'));
+    }
+
+    #[tokio::test]
+    async fn sse_cancel_interrupts_quiet_stream_without_waiting_for_idle_timeout() {
+        use std::convert::Infallible;
+        use std::sync::Arc;
+
+        use axum::body::{Body, Bytes};
+        use axum::http::{header, Response};
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::sync::Notify;
+
+        let app = Router::new().route(
+            "/v1/sessions/{id}/messages",
+            post(|| async {
+                let chunks = futures_util::stream::once(async {
+                    Ok::<_, Infallible>(Bytes::from_static(
+                        b"data: {\"event_type\":\"MESSAGE_EVENT_TYPE_THINKING\"}\n\n",
+                    ))
+                })
+                .chain(futures_util::stream::pending::<Result<Bytes, Infallible>>());
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .expect("quiet SSE response")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind quiet SSE server");
+        let addr = listener.local_addr().expect("quiet SSE server address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = IntelClient {
+            http: reqwest::Client::new(),
+            base: format!("http://{addr}"),
+            api_key: "intel_test_key".to_owned(),
+            org_id: None,
+            sse_idle: Duration::from_secs(5),
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let first_frame = Arc::new(Notify::new());
+        let frame_seen = Arc::clone(&first_frame);
+        let turn = tokio::spawn(async move {
+            client
+                .send_message_stream(
+                    "quiet-session",
+                    "wait quietly",
+                    json!({}),
+                    &cancel_rx,
+                    move |_| {
+                        let frame_seen = Arc::clone(&frame_seen);
+                        async move {
+                            frame_seen.notify_one();
+                        }
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), first_frame.notified())
+            .await
+            .expect("initial SSE frame was not observed");
+        // Let the read loop re-enter stream.next() after processing the frame.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let cancel_started = tokio::time::Instant::now();
+        cancel_tx.send(true).expect("send cancellation");
+        let result = tokio::time::timeout(Duration::from_millis(500), turn)
+            .await
+            .expect("cancellation waited for the SSE idle timeout")
+            .expect("turn task panicked");
+        assert!(matches!(result, Err(AdapterError::Cancelled)));
+        assert!(cancel_started.elapsed() < Duration::from_millis(500));
+
+        server.abort();
     }
 
     #[test]
