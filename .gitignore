@@ -68,3 +68,7 @@ identity.key
 
 # Helm dependency tarballs — regenerable from Chart.lock via `helm dependency build`
 deploy/charts/*/charts/*.tgz
+
+# Prebuilt linux/amd64 deploy artifacts — large binaries, rebuilt via the native
+# VM recipe in specs/IMPLEMENTATION-NOTES.md. Never commit these to git.
+artifacts/
