@@ -2256,3 +2256,67 @@ and these two fixes change no behaviour a well-formed stream exercises. Deployin
 on a production agent nobody can talk to, would be motion rather than progress — the D-L68
 drift-avoidance argument does not stretch this far. They ship with the wren repair, whenever the
 user decides it.
+
+---
+
+**D-L84 — "Cancellation latency" was really "cancel does nothing for 9.5 minutes."**
+
+Fixed in `4c208459`. I had been carrying this on the open list as *cancellation latency*, which
+badly undersold it. Measured, not recalled:
+
+- `config.rs:139` — `INTEL_SSE_IDLE_TIMEOUT_SECS` default `570`
+- `intel.rs:305` — cancel checked **only** at the top of the loop
+- then `tokio::time::timeout(self.sse_idle, stream.next())` with **no** select on the cancel watch
+- `grep "select!|cancel.changed|changed()"` over `intel.rs` returned **nothing**
+
+So a cancel arriving while the stream was quiet went unobserved for up to **~9.5 minutes**, holding
+the task, the HTTP connection and the in-flight gateway request. On the desktop client, pressing stop
+appeared to do nothing for that long. Naming it "latency" is how it stayed low on the list for two
+iterations; **the honest name is the one that gets it fixed.**
+
+The pending read is now selected against the cancel watch, with the idle timeout preserved and its
+570s default **unchanged**. I blocked the tempting shortcut in the acceptance predicate: lowering the
+idle timeout would have masked the symptom while breaking legitimately slow streams — one bug traded
+for another.
+
+**Two edge cases, one of which I flagged and one I did not.** `wait_for_cancel`:
+
+```rust
+loop {
+    if *cancel.borrow() { return; }
+    if cancel.changed().await.is_err() {
+        // A closed sender with a false value is not a cancellation signal.
+        std::future::pending::<()>().await;
+    }
+}
+```
+
+1. **Already-set cancel** (I flagged this): `changed()` only resolves on a change *after* the
+   currently-seen value, so a pre-set flag could never fire it. Handled by checking `borrow()` first.
+2. **Closed sender holding `false`** (I did **not** flag this): if the sender is dropped, `changed()`
+   errors. Returning there would have been read as "cancelled" and would have **spuriously cancelled
+   every turn whose cancel sender was dropped** — turning a latency fix into a correctness
+   regression. It instead stays `pending()` so the read and its idle timeout remain active.
+
+That second case is worth recording because it is the inverse of my usual failure mode. Four times
+this loop the defect was in my brief (D-L59, D-L74, D-L79); here the worker caught a trap my brief
+missed entirely, and documented why. **A brief that names the traps it knows does not stop the
+executor thinking about the ones it doesn't** — which is the argument for stating reasoning in briefs
+rather than only instructions.
+
+**Deliberately not overclaimed**, and said so in the code: the gateway has no turn-abort API, so
+dropping our read neither stops generation nor guarantees the request stops being billed. This
+improves user-visible cancellation latency and local resource release **only**. Given that four
+defects this loop were confident artifacts misdescribing reality (D-L67, D-L78, both halves of
+D-L83), this comment had to be accurate on the first pass rather than corrected later.
+
+Verified by me: `select!` at `intel.rs:309` inside the read loop, top-of-loop `borrow()` retained at
+`:305`, idle default still `570`, **64 unit (was 63) + 14 e2e** pass, clippy `--all-targets -D
+warnings` clean, fmt clean, only `intel.rs` touched, and both
+`sse_multibyte_split_mid_codepoint_is_lossless` and
+`e2e_clean_eof_without_terminal_does_not_publish_partial_response` still green.
+
+**This closes every actionable item on the open list.** What remains needs the user: wren's owner
+identity (D-L78), quota persistence across restart, the scope-key double-budget question, and the
+`feat/intel-acp-adapter` fast-forward (D-L58). Three commits — `5a14f361`, `4c208459` and their notes
+— are held from deploy because wren cannot functionally verify them (D-L83).
