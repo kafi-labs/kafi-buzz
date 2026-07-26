@@ -1872,3 +1872,51 @@ than by hygiene. The deploy brief is the same hardened one that worked at `6d1fb
 D-L52 mechanism intact (no `INTEL_*` edits anywhere, `run-harness.sh` named as the file whose
 `export` wins, restore-on-mismatch rather than repair) plus a new requirement to capture the
 startup journal, so a clean start is evidenced rather than assumed.
+
+---
+
+**D-L76 — DEPLOY VERIFIED. Second consecutive clean production deploy.**
+
+`b4978c05` is live. Every row confirmed by me against the host.
+
+| Check | Result |
+|---|---|
+| Process | PID `2795007` (was `2709580`), `active`, `NRestarts=0` |
+| **Quota env from `/proc/2795007/environ`** | **`120` / `3600`** — untouched again |
+| `buzz-intel-agent` | built `889da100…` → deployed `889da100…` ✅ (was `0de75183…`) |
+| `buzz-acp` | built `97ecf541…` → deployed `97ecf541…` ✅ |
+| Build VM | 49→50→**49** |
+| Tree / sync | clean, `0 0` |
+
+**The build is deterministic, and that is load-bearing.** `buzz-acp` came back **byte-identical**
+to the previous deploy's binary (`97ecf541…`) despite being compiled independently on a fresh
+throwaway VM — its source did not change between `6d1fbf82` and `b4978c05`. That matters beyond
+trivia: the entire verification method in D-L69 and here rests on comparing a locally-built sha to
+the deployed sha. If the build were nondeterministic, matching shas would be luck and mismatched
+shas would be uninformative. Two independent builds producing identical bytes turns sha comparison
+from a ritual into evidence.
+
+**The journal shows a graceful handover, not just a restart.** The outgoing process logged
+`shutting down` → `waiting for in-flight prompts` → `presence set to offline` → `buzz-acp stopped`
+before the new one came up, all inside about one second. So my repeated warning that "the restart
+resets the quota window" was correct but slightly pessimistic in tone — **no in-flight turn is
+killed**; the drain is deliberate.
+
+And the start is healthy end-to-end rather than merely non-crashing:
+
+```
+agent initialized: {"agentInfo":{"intelAgent":"buzz-e2e-assistant",
+  "intelAgentId":"96e5c20b-8aee-4550-9731-4e7814140c1d", ...},"protocolVersion":2}
+connected to relay at wss://vm-buzz-relay-dev-wren.exe.xyz
+owner resolved from BUZZ_AUTH_TAG: f30ba55a…
+discovered 1 channel(s) / subscribed to channel b6b6fab0-… / presence set to online
+```
+
+Resolving `intelAgentId` means the live gateway call succeeded with real credentials *after* the
+deploy — so this evidences connectivity and auth, not only process health. That is the distinction
+worth keeping: **"the unit is active" is a liveness check; "it authenticated to the gateway and
+subscribed to its channel" is a readiness check.** Earlier iterations of this loop asserted the
+former and implied the latter. Requiring the journal in the brief is what closed that gap.
+
+**Two consecutive deploys have now left `120`/`3600` intact.** The D-L52 incident mechanism is no
+longer an untested intention.
