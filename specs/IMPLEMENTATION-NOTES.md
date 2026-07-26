@@ -2053,3 +2053,56 @@ config/service/binary changed," and disclosed the one artefact it did leave (a C
 still active. Four of five recent dispatches have now reported blockers accurately; the pattern is
 that **checkable briefs produce honest reports**, and mine was checkable enough for the block to be
 the cheapest path.
+
+---
+
+## Iteration 11 — routing around a blocked decision instead of waiting on it
+
+**D-L80 — I asked a blocking question, did not get an answer, and found a way to answer the
+underlying question without the permission.**
+
+At the end of iteration 10 I asked whether to re-provision an owner identity on wren, and said I
+would not change `BUZZ_AUTH_TAG` on production without a decision. The loop re-fired with no answer.
+That left three options:
+
+| Option | Verdict |
+|---|---|
+| Change `BUZZ_AUTH_TAG` anyway | **No.** A production config change I explicitly said I would not make unasked. Silence is not consent, and a repeated cron prompt is not a human reply |
+| Wait idle | Wasteful. The *decision* is blocked; the *question behind it* is not |
+| Prove the success path on a throwaway stack with its own owner key | **This.** Zero production risk, needs no permission, and answers what I actually wanted to know |
+
+The distinction worth keeping: **"I need permission to change production" is not the same as "I am
+blocked."** The thing I wanted was evidence that my success-path restructuring did not regress. wren
+was merely the most convenient place to look, and its unreachability made it the *wrong* place. A
+fresh stack is a better instrument anyway — it isolates the test from production state entirely, and
+it is the documented doctrine in the repo's own CLAUDE.md: *"You may create, set up, and deploy a
+new VM yourself to prove/test work — that is the expected path, not an exception."*
+
+**Applying D-L79 to my own brief this time.** Before writing it I actually checked the artifact
+directories rather than trusting the notes, and found something that would have broken the run:
+
+- `artifacts/linux-amd64-b4978c05/` contains **only** `buzz-acp` and `buzz-intel-agent`
+- it does **not** contain `buzz` or `compute-auth-tag`
+- `bootstrap-intel-stack.sh` **dies** without `$ARTIFACT_DIR/buzz`
+
+So the artifact set from the last deploy is incomplete for a from-scratch bootstrap. Rather than
+mix commits by borrowing `buzz` from the older `57141538` set, the brief builds all four binaries at
+one commit — a self-consistent set at `19d74ec3`. Mixing would probably have worked (the CLI is
+untouched by my changes) and would have been exactly the kind of shortcut that makes a later
+"which build was that?" unanswerable.
+
+**The D-L78 lesson is built into the task, not just noted after it.** The bootstrap generates an
+owner keypair into an ephemeral `$SCRATCH` directory — which is precisely how wren's owner key was
+lost. The brief requires copying the owner secret, agent secret, and computed auth tag out to
+`~/.config/buzz/proof-19d74ec3/` at mode 0600 before teardown. A lesson that only appears in this
+log changes nothing; a lesson written into the next brief changes the outcome.
+
+**Also being tested for the first time, incidentally:** the prebuilt-`compute-auth-tag` path from
+D-L67 has never actually executed — it was verified by inspection only, because this driver host is
+macOS and the ELF gate correctly falls through to cargo. This run will exercise the real bootstrap
+end to end again either way, which is the third from-scratch validation of that script.
+
+**The deliverable is deliberately checkable, not plausible:** the proof asks for `17 * 23` so the
+answer is either `391` or it is wrong, with no room for a confidently vague reply to pass. A second
+turn asks an Indonesian question containing an emoji, to exercise the multi-byte path against the
+live gateway rather than only against `sse_multibyte_split_mid_codepoint_is_lossless`.
