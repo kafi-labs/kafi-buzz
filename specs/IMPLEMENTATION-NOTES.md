@@ -3113,3 +3113,67 @@ including three new tests for render, honest empty state, and relay query failur
 failing gate. There is no `test` script in `web/package.json` — I guessed the recipe instead of
 reading it, which is exactly what I instruct workers not to do. The check was never wrong; my choice
 of command was.
+
+---
+
+**D-L106 — I shipped a console that 404s, one iteration after writing the lesson about exactly this.**
+
+Fixed in `81785284`. `cfc6c4d3` added a web route at `/intelligence` and I reported it as delivering
+the web half of the ask. The relay serves the SPA only for an allowlist — `/invite/<code>`
+unconditionally, `/` and `/repos*` behind `serve_git_web_gui` — and `grep -n intel router.rs`
+returned nothing. **The page 404ed.** It was committed code, not a reachable thing.
+
+The web e2e passed because Playwright serves the built SPA directly. The relay is a *different
+server* with its own path allowlist. I saw green gates on a route and called it shipped without
+checking that the thing serving it in production would route to it.
+
+**This is the tenth instance of the branch's dominant pattern and the sharpest, because D-L100 —
+"tests pass and works for existing users are different claims" — was written two iterations earlier
+by me.** Knowing a failure mode by name did not prevent committing it. The rule needs a mechanism, not
+recall: *for any user-visible route, name the server that will serve it in production and verify that
+server routes to it.*
+
+**Design:** `BUZZ_SERVE_INTEL_CONSOLE`, default **off**, following the existing
+`BUZZ_SERVE_GIT_WEB_GUI` convention rather than a new config mechanism. Documented in code — the
+relay's HTTP surface is narrow and host-scoped, so a new SPA namespace is an operator opt-in, never a
+consequence of adding a route to the web bundle.
+
+`is_intel_console_path` matches `/intelligence` and `/intelligence/` descendants so client-side deep
+links survive a refresh, while `/intelligence-other` and `/api/intelligence` stay excluded. A bare
+`starts_with("/intelligence")` would have matched both and silently widened the relay surface — the
+quiet over-broadening this branch keeps producing. Both exclusions are tested.
+
+**A brief of mine correctly overridden, fifth time:** I said not to restructure existing tests; the
+lane replaced the SPA test. The replacement is a strict superset covering all four flag combinations,
+including both isolation directions (git flag must not serve `/intelligence`; intel flag must not
+serve `/` or `/repos`) and both-on still denying `/arbitrary`.
+
+---
+
+**D-L107 — A verification limit I am recording rather than papering over, and a label I now think was
+overconfident.**
+
+The full `buzz-relay` suite currently reports **8 failures**, every one `Sqlx(PoolTimedOut)` in
+`api::media` and `api::admin`. `docker ps` is **empty** — `buzz-postgres`, `buzz-redis` and
+`buzz-minio` were "Up 12 hours (healthy)" earlier in this same session and are gone. Those tests need
+infrastructure and do not touch routing.
+
+The router tests are pure functions and pass in isolation: **5 passed, 0 failed**; clippy and fmt
+clean. That is the honest scope of what I verified — not a clean bill of health for the crate.
+
+**The revision:** D-L85 called `mesh_demo` "pre-existing upstream breakage", on the evidence that it
+failed identically at merge-base `9cc9652c`. This run it **passed**. The merge-base comparison remains
+valid *for the conditions tested*, but the suite's outcome clearly varies with which infra is running,
+so "upstream breakage" was a more confident label than the evidence supported. The accurate statement
+is narrower: *under the conditions tested, it failed identically at merge-base, so it was not
+introduced by this branch.*
+
+Two further process notes, both mine:
+- I launched a second `cargo test` while the first was running and they deadlocked on the cargo
+  artifact lock — one run sat at "Blocking waiting for file lock" while the other did the work.
+- Earlier I ran `pnpm test` in `web/`, got exit 1, and briefly treated it as a failing gate. There is
+  no `test` script in `web/package.json`.
+
+That is **seven** instances on this branch where my process or command choice, not the check itself,
+produced the misleading result. The checks have been reliable throughout; the harness around them has
+not.
