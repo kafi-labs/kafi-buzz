@@ -3032,3 +3032,84 @@ verify a safety property *at the call site* — never from the name, the comment
 | Quota persistence across restart | A restart grants a fresh window |
 | Scope-key double-budget | Documented, undecided |
 | `feat/intel-acp-adapter` fast-forward | Everything lives on `feat/intel-turn-quota`; the branch the original brief named contains none of it |
+
+---
+
+## Iteration 26+ — unblocked by correcting myself, then by a decision
+
+**D-L103 — I reported "blocked" three times for a reason that was not true.**
+
+Five adapter commits sat undeployed because wren's agent is unreachable, so a deploy there "could be
+verified mechanically but not functionally". That conflated **"cannot verify on wren"** with
+**"cannot verify"**. A throwaway stack verifies functionally — I had already done exactly that once
+at `19d74ec3`. The correct sequence was available the whole time: **prove on a throwaway, then deploy
+the identical artifact.**
+
+Deployed as verified: build at `e3e58bee`, functional proof taken **before** shipping (`391` for the
+arithmetic turn, a coherent Indonesian reply with 🔥 intact, both through the normal
+`posted reply → streamed → end_turn` path, and `--list-agents` succeeding with `INTEL_AGENT` unset),
+then the same bytes installed on wren.
+
+Chain of custody verified by me, not from the report: `buzz-intel-agent` built `9a666a32…` = deployed
+`9a666a32…`; `buzz-acp` built `dc3f8ebd…` = deployed `dc3f8ebd…`. PID `3907417`, `NRestarts=0`,
+active, `/proc` environ showing **120 / 3600** — config untouched for the **third** consecutive
+deploy. Credentials persisted to `~/.config/buzz/proof-e3e58bee/` before teardown.
+
+**The lesson is about the shape of the excuse.** "Blocked" was true of one path and I generalised it
+to the goal. Worth asking each time: *is the goal blocked, or only the route I first imagined?*
+
+**Two honest caveats.** exe.dev's count came back **47** against a 49 baseline — wren survives
+(tagged `#do-not-delete`) and the lane's accounting is clean (before 49, created one, deleted one), so
+two *other* VMs went in that window on shared infrastructure. Not ours, but the baseline moved. And
+the lane ran the deploy at **37% context with a mid-task model switch**; it completed cleanly, but a
+context-exhausted worker between steps 3 and 4 would have left wren mid-deploy. I was prepared to
+restore from the `.bak` binaries.
+
+---
+
+**D-L104 — The web ask could not be answered as asked, and the architect pane priced the options.**
+
+`p4` (architect/thinking only, per the user's pane assignment) produced a decision brief grounded in
+the user's own `kafi-signer` spike rather than a parallel invention.
+
+**Its sharpest point, which I had missed:** even server-side custody does **not** deliver "configure
+from a browser". Custody solves *holding the key*; it does not let a browser write another machine's
+local config. The agent still executes somewhere with local state. So the blocker is not only
+security — there is a product question underneath about *where agents execute and how non-secret web
+selection becomes authoritative*. I had been treating custody as the whole obstacle; it was the
+visible half.
+
+Recommendation: build the read-only console now, keep configuration in the verified desktop flow,
+do not ship session-only key entry, and defer custody until named conditions hold — chiefly **a named
+team accepting the credential service, SLO, on-call, rotation, audit and incident response**, and
+credential scope narrow enough that a broad long-lived bearer's blast radius is explicitly accepted.
+It also stated what would flip it: evidence the web surface is the *primary* product, not a companion
+viewer.
+
+**The user agreed.** That is the first product decision in this loop made by the person entitled to
+make it, and it took a brief that priced the options rather than a question that restated them.
+
+---
+
+**D-L105 — Shipped the inventory console (`cfc6c4d3`), and the naming is the feature.**
+
+Read-only. No secret accepted, stored, displayed or transmitted; **no publish path added**; no control
+implying a save. `rg` for api-key patterns across `web/src` returns nothing. Reuses the existing
+`queryEvents` — which already authenticates via NIP-42 — rather than adding a second client. Every
+filter passes explicit kinds, because an open-ended one hits the relay p-gate and 403s. Kind constants
+mirror `buzz-core` (`KIND_PERSONA` 30175 at `kind.rs:165`, `KIND_MANAGED_AGENT` 30177 at `:183`) and
+say so, keeping the source of truth findable.
+
+**The part that makes it trustworthy:** it refuses to claim it lists every agent. Kind 30175 is
+visible to its author unless carrying a `shared` tag, so the page states *"This list may be
+incomplete: personas are visible only to their author unless they carry a shared tag"* and labels each
+entry Shared / Not shared. A console that silently drops entries when visibility rules bite would have
+been the tenth misdescribing artifact here.
+
+Verified by me: `pnpm check` 0, `typecheck` 0, `build` 0, `test:e2e:smoke` 0 with **9 passing**,
+including three new tests for render, honest empty state, and relay query failure.
+
+**My own error, sixth of its kind:** I ran `pnpm test`, got exit 1, and briefly treated it as a
+failing gate. There is no `test` script in `web/package.json` — I guessed the recipe instead of
+reading it, which is exactly what I instruct workers not to do. The check was never wrong; my choice
+of command was.
