@@ -260,6 +260,9 @@ pub struct Config {
     /// Whether the configured web bundle serves Git browser routes in addition
     /// to the public invite landing page. Defaults to false.
     pub serve_git_web_gui: bool,
+    /// Whether the configured web bundle serves the Intelligence Platform
+    /// console. Defaults to false so a new SPA path is operator opt-in.
+    pub serve_intel_console: bool,
 }
 
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
@@ -848,6 +851,9 @@ impl Config {
         let serve_git_web_gui = std::env::var("BUZZ_SERVE_GIT_WEB_GUI")
             .map(|value| value == "true" || value == "1")
             .unwrap_or(false);
+        let serve_intel_console = std::env::var("BUZZ_SERVE_INTEL_CONSOLE")
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(false);
 
         if let Some(ref dir) = web_dir {
             if !dir.join("index.html").is_file() {
@@ -921,6 +927,7 @@ impl Config {
             admin,
             web_dir,
             serve_git_web_gui,
+            serve_intel_console,
         })
     }
 }
@@ -971,6 +978,10 @@ mod tests {
             "serve_git_web_gui should default to false"
         );
         assert!(
+            !config.serve_intel_console,
+            "serve_intel_console should default to false"
+        );
+        assert!(
             !config.require_media_get_auth,
             "require_media_get_auth should default to false for staged client rollout"
         );
@@ -982,6 +993,27 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    #[test]
+    fn intel_console_flag_requires_explicit_truthy_value() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_SERVE_INTEL_CONSOLE");
+
+        std::env::set_var("BUZZ_SERVE_INTEL_CONSOLE", "1");
+        let enabled = Config::from_env().expect("config").serve_intel_console;
+
+        std::env::set_var("BUZZ_SERVE_INTEL_CONSOLE", "false");
+        let disabled = Config::from_env().expect("config").serve_intel_console;
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_SERVE_INTEL_CONSOLE", value);
+        } else {
+            std::env::remove_var("BUZZ_SERVE_INTEL_CONSOLE");
+        }
+
+        assert!(enabled);
+        assert!(!disabled);
     }
 
     #[test]
