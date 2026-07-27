@@ -3177,3 +3177,65 @@ Two further process notes, both mine:
 That is **seven** instances on this branch where my process or command choice, not the check itself,
 produced the misleading result. The checks have been reliable throughout; the harness around them has
 not.
+
+---
+
+## The blocker is gone
+
+**D-L108 — wren answers again. Restored, and proven by a round trip rather than by config.**
+
+The user authorised the production change ("can you create it again, I trust you do it"). Done, and
+**verified end to end**: prompt `3d341f9e…` → reply **"The result of 17 times 23 is 391."**
+
+For the whole prior session wren ran correct, freshly-deployed software that *nobody could talk to* —
+`respond_to=owner-only` against an owner pubkey whose secret died in a bootstrap scratch directory.
+Every proof had to be taken on throwaways. That is over.
+
+**How it was done, and the order matters:**
+
+1. New owner keypair generated and **persisted first** — `~/.config/buzz/wren-owner/`, `0600` in a
+   `0700` dir. The previous identity was lost precisely because persistence came last, so it came
+   first this time.
+2. NIP-OA attestation recomputed against wren's **existing** agent pubkey (read from the host's own
+   journal, not recalled). The agent's keypair is untouched, so its relay identity never moved —
+   only *who it trusts* changed.
+3. Launcher updated surgically: timestamped `.bak`, single-line `sed` (that file also holds the
+   agent private key and API key, so no dumping), `bash -n` before restart, new pubkey count 1 /
+   old count 0, binary sha unchanged, `/proc` environ still `120`/`3600`.
+4. Relay membership granted at **least privilege** (`--role member`), no restart required —
+   `add-member` publishes a kind:13534 roster via Redis.
+
+**Testing caught two failures that "looks done" would have shipped as success:**
+
+- After the launcher change, posting as the owner returned **`relay_membership_required`**. The agent
+  trusted the new owner; the *relay* had never heard of that pubkey. Identity restored and still
+  mute. Step 4 exists only because I tested step 3.
+- After membership, the agent logged **nothing**. Comparing against the last known-good message
+  showed why: it used `nostr:npub1xcu…`, mine used `nostr:36391f29…`. **The mention parser needs
+  bech32; hex is not recognised.** The message was accepted by the relay and silently ignored by the
+  agent — an "accepted" that means nothing.
+
+Both would have produced a confident, wrong "restored" claim. The journal then showed the agent
+waking, injecting its NIP-AE system prompt, creating a session, hitting `409 Session is ended`, and
+recreating + retrying — the recreate-on-gone path from D-L63 working exactly as documented.
+
+**Three measurement errors of mine in this one stretch**, all of which generated false signals:
+
+1. A wait-loop grepping for `391` — which appears inside the agent's pubkey `36391f29…` **in my own
+   prompt**. It matched my own text and reported success.
+2. Author attribution from `--format compact`, which is sig-stripped and carries **no `pubkey`
+   field** — it labelled the agent's own reply as mine.
+3. The final poll exited non-zero purely because its trailing `[ -z "$NEW" ]` guard evaluated false.
+   The task is recorded as "failed" while having found the answer.
+
+That is **eight** instances on this branch where my harness, not the check, produced the misleading
+result. The checks have been reliable throughout. The consistent shape: *a convenience wrapper that
+answers a slightly different question than the one asked.*
+
+**What this unblocks:** live-agent verification is possible again, so the opt-in real-AI e2e suite
+has a valid target, and Phase 1 of the platform roadmap depends on no outstanding decision.
+
+**Recorded for whoever operates this next:** the owner secret lives at
+`~/.config/buzz/wren-owner/owner.sk`. If it is lost, the agent becomes unreachable again and the
+repair is this note. The old owner `f30ba55a…` remains in the membership list and is harmless — its
+secret does not exist — but the list is not accurate until it is removed.
