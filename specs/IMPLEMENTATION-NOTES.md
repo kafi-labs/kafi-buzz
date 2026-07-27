@@ -2964,3 +2964,71 @@ mysteries:
 |---|---|
 | Successful stdout is unredacted, so a hostile or mistyped gateway could reflect the key in an agent `name` | Only reachable with an untrusted gateway URL or PATH substitution. Worth a test if the roster is ever fed from a less-trusted source |
 | The stale-response generation guard and the model-clearing-on-runtime-switch are real code but unpinned by tests | Protection exists; the contract is not locked. Cheap regression tests, no behaviour change |
+
+---
+
+**D-L102 — Pinned the last two protections, and my own tooling misled me twice more.**
+
+Shipped as `55f36b6c`. Five tests, **zero production changes** — both guards were observable through
+test-only seams, so no seam had to be added.
+
+**What is pinned, and why these cases specifically:**
+
+- A **late failure** from a superseded request cannot replace a successful roster or raise an error
+  banner. The equality check on the failure path exists *solely* for this, which makes it the branch
+  a refactor is most likely to drop while the success check survives.
+- A roster arriving for **credentials the user has since replaced** — the case with actual user
+  consequence, which is why it is pinned by credential change rather than bare request ordering.
+- Model clearing in **both** directions across Intel↔Claude, asserted explicitly rather than by
+  snapshot.
+- The **deliberate exception**: an empty `previousRuntime` preserves a freshly loaded model. An
+  unpinned intentional exception is exactly what a later reader "fixes" into a bug.
+
+**Two more tooling failures of my own, both caught before they cost anything:**
+
+1. I grepped for the blindspot report's *word* — "generation" — and got nothing, nearly concluding a
+   working guard was missing. The code calls it `requestIdRef`. I searched for the description
+   instead of the thing.
+2. I used `git diff --name-only` to check what changed. It **does not show new files**, so two
+   roster tests looked absent when they were in a new untracked file. `git status --porcelain` is
+   the complete picture.
+
+Neither was a report being wrong; both were my verification giving a confident *partial* answer.
+That makes **four** instances on this branch (piped exit codes, `tail` truncation, zsh `/dev/tcp`,
+and now these two) where the harness around a sound check was the weak link. The consistent shape:
+**a convenience wrapper that answers a slightly different question than the one I asked.** The
+defence is the same each time — when a result is surprising, re-run the bare, complete command
+before believing it.
+
+**A number I had been reporting inconsistently, now reconciled:** desktop Rust is **1627 library
+tests + 3 diagnostic**. Earlier entries quote 1627, 1629 and 1630 depending on whether I summed the
+diagnostic suite. All three were the same tree.
+
+**Standard adopted:** anything touching async ordering gets the **full, unfiltered suite run twice**.
+A filtered run is what hid the flake in D-L101 — from the lane and from me.
+
+---
+
+## Closing state of this branch
+
+Actionable work is exhausted. 55+ commits, ~20 substantive. Suites: **84** intel-agent, **1627+3**
+desktop Rust, **3495** desktop JS, ~1871 workspace unit — all green; workspace clippy and fmt clean.
+
+**The one finding worth carrying to the next piece of work.** Nine defects on this branch were not
+broken logic but **artifacts misdescribing themselves**: a README asserting the inverse of the
+behaviour; a health-check suite that only measured installability; a public `evict_expired_at` never
+called; a cap comment promising a bound it did not enforce; a labelled field that configured nothing;
+a comment describing a dropdown never built; a renderer ignoring a field model that was already under
+test; `"Anthropic (locked)"` displayed for a gateway that is not Anthropic; and my own "fixed" claim
+that held only for fresh records. **Every one passed review because it looked deliberate.** The rule:
+verify a safety property *at the call site* — never from the name, the comment, or the test beside it.
+
+**Blocked on the user, in priority order:**
+
+| Item | Why it is blocking |
+|---|---|
+| **wren's owner identity** | 14 backend commits are undeployed and functionally unverifiable — nobody can send that agent a message. Repair is proven end-to-end on a throwaway with credentials persisted at `~/.config/buzz/proof-19d74ec3/`; it changes production config |
+| **Web console credential custody** | Server-side custody, session-only entry, or read-only. Not effort — the API key is deliberately never published, correctly |
+| Quota persistence across restart | A restart grants a fresh window |
+| Scope-key double-budget | Documented, undecided |
+| `feat/intel-acp-adapter` fast-forward | Everything lives on `feat/intel-turn-quota`; the branch the original brief named contains none of it |
