@@ -318,6 +318,35 @@ pub const KIND_MANAGED_AGENT: u32 = 30177;
 /// allowlist pubkeys, no source or local ids, no filesystem paths, no secrets.
 pub const KIND_TEAM_CATALOG: u32 = 30178;
 
+// Fork-private parameterized-replaceable kinds are allocated from 30900–30949.
+// Never allocate a fork-private kind adjacent to an upstream cluster: keeping a
+// separate block makes future upstream synchronization mechanically safe.
+
+/// Agent runtime status (parameterized replaceable, runner-authored).
+///
+/// Published by an agent runner (the process supervising a managed agent's ACP
+/// harness) so clients can see runtime state they cannot otherwise observe:
+/// process state, heartbeat, restart count, and the last error *class*.
+/// Addressed by `(pubkey, kind, d_tag)` where `d_tag` is the agent's pubkey —
+/// or, during enrollment, the persona slug the candidate was minted for.
+///
+/// Content is plaintext and MUST NOT carry secrets: no agent secret key, no
+/// API key, no env vars, and no gateway URL. Readers MUST pin the author to a
+/// known runner pubkey; the relay accepts this kind from any member, so an
+/// unpinned reader can be fed a forged status row.
+pub const KIND_AGENT_RUNTIME_STATUS: u32 = 30900;
+
+/// Intelligence-gateway agent catalog (parameterized replaceable, runner-authored).
+///
+/// A runner-published projection of the agents deployed on an intelligence
+/// gateway, so clients can browse them without holding the gateway credential
+/// or reaching the gateway directly. Addressed by `(pubkey, kind, d_tag)` where
+/// `d_tag` is the gateway id.
+///
+/// Content is plaintext and MUST NOT carry the gateway credential or URL — only
+/// the agent names, a reachability/auth probe result, and a fetch timestamp.
+pub const KIND_INTEL_GATEWAY_CATALOG: u32 = 30901;
+
 // NIP-56 reporting
 /// NIP-56: Report an event, pubkey, or blob to relay moderators (kind:1984).
 ///
@@ -861,6 +890,8 @@ const _: () = assert!(is_parameterized_replaceable(KIND_TEAM)); // 30176 ∈ 300
 const _: () = assert!(is_parameterized_replaceable(KIND_MANAGED_AGENT)); // 30177 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_TEAM_CATALOG)); // 30178 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_PRIVATE_MANAGED_AGENT)); // 30179 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_AGENT_RUNTIME_STATUS)); // 30900 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_INTEL_GATEWAY_CATALOG)); // 30901 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WORKFLOW_DEF)); // 30620 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_EVENT_REMINDER)); // 30300 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 30622 ∈ 30000–39999

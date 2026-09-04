@@ -6,14 +6,21 @@
 
 import { Route as rootRouteImport } from "./routes/root";
 import { Route as reposRouteImport } from "./routes/repos";
+import { Route as intelligenceRouteImport } from "./routes/intelligence";
 import { Route as indexRouteImport } from "./routes/index";
 import { Route as reposDotrepoIdRouteImport } from "./routes/repos.$repoId";
 import { Route as inviteDotcodeRouteImport } from "./routes/invite.$code";
+import { Route as intelligenceDotagentsDotagentPubkeyRouteImport } from "./routes/intelligence.agents.$agentPubkey";
 import { Route as reposDotrepoIdDotblobDotsplatRouteImport } from "./routes/repos.$repoId.blob.$";
 
 const reposRoute = reposRouteImport.update({
   id: "/repos",
   path: "/repos",
+  getParentRoute: () => rootRouteImport,
+} as any);
+const intelligenceRoute = intelligenceRouteImport.update({
+  id: "/intelligence",
+  path: "/intelligence",
   getParentRoute: () => rootRouteImport,
 } as any);
 const indexRoute = indexRouteImport.update({
@@ -31,6 +38,12 @@ const inviteDotcodeRoute = inviteDotcodeRouteImport.update({
   path: "/invite/$code",
   getParentRoute: () => rootRouteImport,
 } as any);
+const intelligenceDotagentsDotagentPubkeyRoute =
+  intelligenceDotagentsDotagentPubkeyRouteImport.update({
+    id: "/intelligence/agents/$agentPubkey",
+    path: "/intelligence/agents/$agentPubkey",
+    getParentRoute: () => rootRouteImport,
+  } as any);
 const reposDotrepoIdDotblobDotsplatRoute =
   reposDotrepoIdDotblobDotsplatRouteImport.update({
     id: "/repos/$repoId/blob/$",
@@ -40,55 +53,69 @@ const reposDotrepoIdDotblobDotsplatRoute =
 
 export interface FileRoutesByFullPath {
   "/": typeof indexRoute;
+  "/intelligence": typeof intelligenceRoute;
   "/repos": typeof reposRoute;
   "/invite/$code": typeof inviteDotcodeRoute;
   "/repos/$repoId": typeof reposDotrepoIdRoute;
+  "/intelligence/agents/$agentPubkey": typeof intelligenceDotagentsDotagentPubkeyRoute;
   "/repos/$repoId/blob/$": typeof reposDotrepoIdDotblobDotsplatRoute;
 }
 export interface FileRoutesByTo {
   "/": typeof indexRoute;
+  "/intelligence": typeof intelligenceRoute;
   "/repos": typeof reposRoute;
   "/invite/$code": typeof inviteDotcodeRoute;
   "/repos/$repoId": typeof reposDotrepoIdRoute;
+  "/intelligence/agents/$agentPubkey": typeof intelligenceDotagentsDotagentPubkeyRoute;
   "/repos/$repoId/blob/$": typeof reposDotrepoIdDotblobDotsplatRoute;
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport;
   "/": typeof indexRoute;
+  "/intelligence": typeof intelligenceRoute;
   "/repos": typeof reposRoute;
   "/invite/$code": typeof inviteDotcodeRoute;
   "/repos/$repoId": typeof reposDotrepoIdRoute;
+  "/intelligence/agents/$agentPubkey": typeof intelligenceDotagentsDotagentPubkeyRoute;
   "/repos/$repoId/blob/$": typeof reposDotrepoIdDotblobDotsplatRoute;
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath;
   fullPaths:
     | "/"
+    | "/intelligence"
     | "/repos"
     | "/invite/$code"
     | "/repos/$repoId"
+    | "/intelligence/agents/$agentPubkey"
     | "/repos/$repoId/blob/$";
   fileRoutesByTo: FileRoutesByTo;
   to:
     | "/"
+    | "/intelligence"
     | "/repos"
     | "/invite/$code"
     | "/repos/$repoId"
+    | "/intelligence/agents/$agentPubkey"
     | "/repos/$repoId/blob/$";
   id:
     | "__root__"
     | "/"
+    | "/intelligence"
     | "/repos"
     | "/invite/$code"
     | "/repos/$repoId"
+    | "/intelligence/agents/$agentPubkey"
     | "/repos/$repoId/blob/$";
   fileRoutesById: FileRoutesById;
 }
 export interface RootRouteChildren {
   indexRoute: typeof indexRoute;
+  intelligenceRoute: typeof intelligenceRoute;
   reposRoute: typeof reposRoute;
   inviteDotcodeRoute: typeof inviteDotcodeRoute;
   reposDotrepoIdRoute: typeof reposDotrepoIdRoute;
+  intelligenceDotagentsDotagentPubkeyRoute: typeof intelligenceDotagentsDotagentPubkeyRoute;
   reposDotrepoIdDotblobDotsplatRoute: typeof reposDotrepoIdDotblobDotsplatRoute;
 }
 
@@ -99,6 +126,13 @@ declare module "@tanstack/react-router" {
       path: "/repos";
       fullPath: "/repos";
       preLoaderRoute: typeof reposRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/intelligence": {
+      id: "/intelligence";
+      path: "/intelligence";
+      fullPath: "/intelligence";
+      preLoaderRoute: typeof intelligenceRouteImport;
       parentRoute: typeof rootRouteImport;
     };
     "/": {
@@ -122,6 +156,13 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof inviteDotcodeRouteImport;
       parentRoute: typeof rootRouteImport;
     };
+    "/intelligence/agents/$agentPubkey": {
+      id: "/intelligence/agents/$agentPubkey";
+      path: "/intelligence/agents/$agentPubkey";
+      fullPath: "/intelligence/agents/$agentPubkey";
+      preLoaderRoute: typeof intelligenceDotagentsDotagentPubkeyRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
     "/repos/$repoId/blob/$": {
       id: "/repos/$repoId/blob/$";
       path: "/repos/$repoId/blob/$";
@@ -134,9 +175,12 @@ declare module "@tanstack/react-router" {
 
 const rootRouteChildren: RootRouteChildren = {
   indexRoute: indexRoute,
+  intelligenceRoute: intelligenceRoute,
   reposRoute: reposRoute,
   inviteDotcodeRoute: inviteDotcodeRoute,
   reposDotrepoIdRoute: reposDotrepoIdRoute,
+  intelligenceDotagentsDotagentPubkeyRoute:
+    intelligenceDotagentsDotagentPubkeyRoute,
   reposDotrepoIdDotblobDotsplatRoute: reposDotrepoIdDotblobDotsplatRoute,
 };
 export const routeTree = rootRouteImport

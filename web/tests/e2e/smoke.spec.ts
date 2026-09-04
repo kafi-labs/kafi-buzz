@@ -347,3 +347,146 @@ test("invite download falls back for mobile and non-desktop devices", async ({
     await context.close();
   }
 });
+
+type IntelligenceEventFixture = {
+  content: string;
+  id: string;
+  kind: number;
+  tags: string[][];
+};
+
+async function mockIntelligenceRelay(
+  page: import("@playwright/test").Page,
+  options: { error?: boolean; events?: IntelligenceEventFixture[] },
+) {
+  await page.addInitScript((relayOptions) => {
+    type Listener = (event: { data?: string }) => void;
+
+    class IntelligenceWebSocket {
+      private listeners = new Map<string, Listener[]>();
+
+      constructor() {
+        window.setTimeout(() => this.emit("open", {}), 0);
+      }
+
+      addEventListener(type: string, listener: Listener) {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      close() {}
+
+      send(message: string) {
+        const frame = JSON.parse(message) as [string, string, unknown];
+        if (frame[0] !== "REQ") return;
+
+        const requests = (
+          window as Window & { __intelligenceRequests?: unknown[] }
+        ).__intelligenceRequests;
+        requests?.push(frame[2]);
+
+        if (relayOptions.error) {
+          this.emit("error", {});
+          return;
+        }
+
+        for (const event of relayOptions.events ?? []) {
+          this.emit("message", {
+            data: JSON.stringify(["EVENT", frame[1], event]),
+          });
+        }
+        this.emit("message", { data: JSON.stringify(["EOSE", frame[1]]) });
+      }
+
+      private emit(type: string, event: { data?: string }) {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    (
+      window as Window & { __intelligenceRequests?: unknown[] }
+    ).__intelligenceRequests = [];
+    window.WebSocket = IntelligenceWebSocket as unknown as typeof WebSocket;
+  }, options);
+}
+
+test("intelligence inventory renders fetched visible events with explicit kinds", async ({
+  page,
+}) => {
+  await mockIntelligenceRelay(page, {
+    events: [
+      {
+        id: "persona-event",
+        kind: 30175,
+        tags: [["d", "researcher"], ["shared"]],
+        content: JSON.stringify({
+          display_name: "Researcher",
+          description: "Finds and synthesizes evidence.",
+        }),
+      },
+      {
+        id: "agent-event",
+        kind: 30177,
+        tags: [["d", "agent-pubkey"]],
+        content: JSON.stringify({ name: "Research worker" }),
+      },
+    ],
+  });
+
+  await page.goto("/intelligence");
+
+  await expect(
+    page.getByRole("heading", { name: "Intelligence inventory" }),
+  ).toBeVisible();
+  await expect(page.getByText("Researcher", { exact: true })).toBeVisible();
+  await expect(page.getByText("researcher", { exact: true })).toBeVisible();
+  await expect(page.getByText("Finds and synthesizes evidence.")).toBeVisible();
+  await expect(page.getByText("Shared", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Research worker", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("Not shared", { exact: true })).toBeVisible();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as Window & { __intelligenceRequests?: unknown[] })
+            .__intelligenceRequests,
+      ),
+    )
+    .toEqual([{ kinds: [30175, 30177] }]);
+});
+
+test("intelligence inventory honestly reports an empty visible result", async ({
+  page,
+}) => {
+  await mockIntelligenceRelay(page, { events: [] });
+
+  await page.goto("/intelligence");
+
+  await expect(
+    page.getByRole("heading", { name: "Nothing visible to you" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText(
+      "This list may be incomplete: personas are visible only to their author unless they carry a shared tag.",
+    ),
+  ).toBeVisible();
+});
+
+test("intelligence inventory reports relay query failures", async ({
+  page,
+}) => {
+  await mockIntelligenceRelay(page, { error: true });
+
+  await page.goto("/intelligence");
+
+  await expect(
+    page.getByRole("heading", {
+      name: "Could not read the intelligence inventory",
+    }),
+  ).toBeVisible();
+  await expect(page.getByText("WebSocket connection failed")).toBeVisible();
+});

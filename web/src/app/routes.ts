@@ -6,4 +6,9 @@ export const routes = rootRoute("root.tsx", [
   route("/repos", "repos.tsx"),
   route("/repos/$repoId", "repos.$repoId.tsx"),
   route("/repos/$repoId/blob/$", "repos.$repoId.blob.$.tsx"),
+  route("/intelligence", "intelligence.tsx"),
+  route(
+    "/intelligence/agents/$agentPubkey",
+    "intelligence.agents.$agentPubkey.tsx",
+  ),
 ]);

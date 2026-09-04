@@ -3887,18 +3887,18 @@ mod postgres_tests {
     }
 
     /// Drive a single POST /events request through the router and return the
-    /// HTTP status code.
-    async fn post_events(
+    /// HTTP status code plus decoded response body.
+    async fn post_events_json(
         state: Arc<crate::state::AppState>,
         host: &str,
         pubkey_hex: &str,
         body: &[u8],
-    ) -> axum::http::StatusCode {
+    ) -> (axum::http::StatusCode, Value) {
         use axum::body::Body;
         use axum::http::{header, Request};
         use tower::ServiceExt;
 
-        crate::router::build_router(state)
+        let response = crate::router::build_router(state)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3909,8 +3909,83 @@ mod postgres_tests {
                     .expect("build request"),
             )
             .await
-            .expect("router oneshot")
-            .status()
+            .expect("router oneshot");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read bounded response body");
+        let body = serde_json::from_slice(&bytes).expect("decode JSON response body");
+        (status, body)
+    }
+
+    /// Drive a single POST /events request through the router and return the
+    /// HTTP status code.
+    async fn post_events(
+        state: Arc<crate::state::AppState>,
+        host: &str,
+        pubkey_hex: &str,
+        body: &[u8],
+    ) -> axum::http::StatusCode {
+        post_events_json(state, host, pubkey_hex, body).await.0
+    }
+
+    async fn assert_fork_private_kind_is_accepted(kind: u32, coordinate: &str) {
+        let state = bridge_handler_test_state().await.expect(
+            "local Postgres/Redis not reachable — start the dev services before running ignored bridge handler tests",
+        );
+        let host = format!("bridge-intel-{}.local", uuid::Uuid::new_v4().simple());
+        state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community");
+
+        let client_keys = Keys::generate();
+        let pubkey_hex = client_keys.public_key().to_hex();
+        let d_tag = Tag::custom(
+            nostr::TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
+            [coordinate],
+        );
+        let event = EventBuilder::new(Kind::Custom(kind as u16), "{}")
+            .tags([d_tag])
+            .sign_with_keys(&client_keys)
+            .expect("sign fork-private event");
+        let expected_event_id = event.id.to_hex();
+        let event_json = serde_json::to_vec(&event).expect("serialize event");
+
+        let (status, response) = post_events_json(state, &host, &pubkey_hex, &event_json).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "response: {response}");
+        assert_eq!(response["accepted"], true, "response: {response}");
+        assert_eq!(
+            response["event_id"], expected_event_id,
+            "response: {response}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Postgres and Redis"]
+    fn submit_event_accepts_agent_runtime_status_kind_through_ingest() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+        rt.block_on(assert_fork_private_kind_is_accepted(
+            buzz_core::kind::KIND_AGENT_RUNTIME_STATUS,
+            "agent-pubkey",
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires Postgres and Redis"]
+    fn submit_event_accepts_intel_gateway_catalog_kind_through_ingest() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+        rt.block_on(assert_fork_private_kind_is_accepted(
+            buzz_core::kind::KIND_INTEL_GATEWAY_CATALOG,
+            "gateway-id",
+        ));
     }
 
     /// Collect buzz_events_rejected_total with (transport, reason) labels from
