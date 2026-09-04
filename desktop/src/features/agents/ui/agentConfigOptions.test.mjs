@@ -147,6 +147,24 @@ test("runtimeSupportsLlmProviderSelection is false for codex and claude", () => 
   assert.equal(runtimeSupportsLlmProviderSelection("claude"), false);
 });
 
+test("runtimeSupportsLlmProviderSelection is false for intel (provider_locked free-text)", () => {
+  // String bootstrap still excludes intel from LLM catalog. With a catalog
+  // entry, provider_locked + providerEnvVar also yields false — free-text
+  // gateway is used instead (see agentConfigCore freeText mode).
+  assert.equal(runtimeSupportsLlmProviderSelection("intel"), false);
+  assert.equal(
+    runtimeSupportsLlmProviderSelection({
+      id: "intel",
+      providerEnvVar: "INTEL_GATEWAY_URL",
+      modelEnvVar: "INTEL_AGENT",
+      providerLocked: true,
+      requiredNormalizedFields: ["model", "provider"],
+      apiKeyEnvVar: "INTEL_API_KEY",
+    }),
+    false,
+  );
+});
+
 test("resetConfigForHarnessChange clears harness-specific values", () => {
   const config = {
     env_vars: { BUZZ_AGENT_THINKING_EFFORT: "high", KEEP_ME: "yes" },

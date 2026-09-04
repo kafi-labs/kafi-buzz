@@ -184,6 +184,9 @@ export type RawAcpRuntimeCatalogEntry = {
   max_tokens_env_var?: string | null;
   context_limit_env_var?: string | null;
   max_rounds_env_var?: string | null;
+  provider_locked?: boolean;
+  required_normalized_fields?: string[];
+  api_key_env_var?: string | null;
   install_hint: string;
   install_instructions_url: string;
   can_auto_install: boolean;
@@ -689,6 +692,9 @@ export function fromRawAcpRuntimeCatalogEntry(
     maxTokensEnvVar: entry.max_tokens_env_var ?? null,
     contextLimitEnvVar: entry.context_limit_env_var ?? null,
     maxRoundsEnvVar: entry.max_rounds_env_var ?? null,
+    providerLocked: entry.provider_locked ?? false,
+    requiredNormalizedFields: entry.required_normalized_fields ?? [],
+    apiKeyEnvVar: entry.api_key_env_var ?? null,
     installHint: entry.install_hint,
     installInstructionsUrl: entry.install_instructions_url,
     canAutoInstall: entry.can_auto_install,

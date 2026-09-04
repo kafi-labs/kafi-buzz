@@ -8375,7 +8375,9 @@ function withMockRuntimeConfigMetadata(
           ? "BUZZ_AGENT_MODEL"
           : runtime.id === "goose"
             ? "GOOSE_MODEL"
-            : null,
+            : runtime.id === "intel"
+              ? "INTEL_AGENT"
+              : null,
     provider_env_var:
       "provider_env_var" in runtime
         ? runtime.provider_env_var
@@ -8383,7 +8385,9 @@ function withMockRuntimeConfigMetadata(
           ? "BUZZ_AGENT_PROVIDER"
           : runtime.id === "goose"
             ? "GOOSE_PROVIDER"
-            : null,
+            : runtime.id === "intel"
+              ? "INTEL_GATEWAY_URL"
+              : null,
     thinking_env_var:
       "thinking_env_var" in runtime
         ? runtime.thinking_env_var
@@ -8413,6 +8417,28 @@ function withMockRuntimeConfigMetadata(
         ? runtime.max_rounds_env_var
         : runtime.id === "buzz-agent"
           ? "BUZZ_AGENT_MAX_ROUNDS"
+          : null,
+    provider_locked:
+      "provider_locked" in runtime
+        ? runtime.provider_locked
+        : !!(
+            runtime.id === "claude" ||
+            runtime.id === "codex" ||
+            runtime.id === "intel"
+          ),
+    required_normalized_fields:
+      "required_normalized_fields" in runtime
+        ? runtime.required_normalized_fields
+        : runtime.id === "buzz-agent" ||
+            runtime.id === "goose" ||
+            runtime.id === "intel"
+          ? ["model", "provider"]
+          : [],
+    api_key_env_var:
+      "api_key_env_var" in runtime
+        ? runtime.api_key_env_var
+        : runtime.id === "intel"
+          ? "INTEL_API_KEY"
           : null,
   };
 }

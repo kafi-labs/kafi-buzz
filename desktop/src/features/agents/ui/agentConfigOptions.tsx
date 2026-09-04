@@ -7,6 +7,21 @@ import type { RuntimeFileConfigSubset } from "@/shared/api/tauri";
 // Dialogs import getDefaultPersonaRuntime via this re-export; lib code imports
 // directly from lib/resolvePersonaRuntime.
 export { getDefaultPersonaRuntime } from "../lib/resolvePersonaRuntime";
+// Catalog-driven capability helpers (single source of truth for create/edit gates).
+export {
+  runtimeSupportsLlmProviderSelection,
+  runtimeUsesFreeTextProvider,
+  runtimeUsesFreeTextModel,
+  runtimeRequiredNormalizedFields,
+  runtimeApiKeyEnvVar,
+  type RuntimeCapabilityCatalog,
+} from "../lib/agentConfigCore";
+import {
+  runtimeSupportsLlmProviderSelection,
+  runtimeRequiredNormalizedFields,
+  runtimeApiKeyEnvVar,
+  type RuntimeCapabilityCatalog,
+} from "../lib/agentConfigCore";
 
 /**
  * Provider ids suppressed from the selection list on internal Block builds.
@@ -198,10 +213,6 @@ export function isMissingRequiredDropdownField(
   value: string,
 ) {
   return field?.isRequired === true && value.trim().length === 0;
-}
-
-export function runtimeSupportsLlmProviderSelection(runtimeId: string) {
-  return runtimeId === "buzz-agent" || runtimeId === "goose";
 }
 
 /** Clears values whose meaning or support changes with the selected harness. */
@@ -660,6 +671,7 @@ export function computeLocalModeGate({
   model,
   provider,
   runtimeId,
+  runtime,
   runtimeFileConfig,
 }: {
   /** Optional baked build env key names (Block-internal builds only).
@@ -687,6 +699,11 @@ export function computeLocalModeGate({
   model: string;
   provider: string;
   runtimeId: string;
+  /**
+   * Catalog entry for the selected runtime (when loaded). Preferred over the
+   * id-only string for required fields and free-text provider/model gates.
+   */
+  runtime?: RuntimeCapabilityCatalog | null;
   /** Optional file-layer config for the runtime (e.g. goose config.yaml).
    *  When provided, requirements already satisfied there are silenced. */
   runtimeFileConfig?: RuntimeFileConfigSubset | null;
@@ -724,7 +741,17 @@ export function computeLocalModeGate({
     };
   }
 
-  const needsProviderSelection = runtimeSupportsLlmProviderSelection(runtimeId);
+  const catalog = runtime ?? null;
+  const needsLlmProviderSelection = runtimeSupportsLlmProviderSelection(
+    catalog ?? runtimeId,
+  );
+  // Catalog-declared required normalized fields (model/provider). Fallback for
+  // goose/buzz-agent when catalog is not loaded: require both when LLM-capable.
+  const requiredFields = runtimeRequiredNormalizedFields(catalog);
+  const requireProvider =
+    requiredFields.includes("provider") || needsLlmProviderSelection;
+  const requireModel =
+    requiredFields.includes("model") || needsLlmProviderSelection;
 
   // File-layer values for goose-style runtimes. These silence requirements
   // when the runtime config file provides the value — the file layer is the
@@ -740,18 +767,27 @@ export function computeLocalModeGate({
     model.trim() || (globalModel ?? "").trim() || fileModel;
 
   const missingNormalizedFields: string[] = [];
-  if (needsProviderSelection) {
-    if (effectiveProvider.length === 0)
-      missingNormalizedFields.push("provider");
-    if (effectiveModel.length === 0) missingNormalizedFields.push("model");
+  if (requireProvider && effectiveProvider.length === 0) {
+    missingNormalizedFields.push("provider");
+  }
+  if (requireModel && effectiveModel.length === 0) {
+    missingNormalizedFields.push("model");
   }
 
   // Credential keys depend on the selected provider (empty provider → no keys
   // required beyond the normalized field gate above).
   // Use the effective provider (env → global → file) so credential
   // requirements are computed correctly for all config sources.
-  const providerForKeys = needsProviderSelection ? effectiveProvider : "";
-  const requiredKeys = requiredCredentialEnvKeys(runtimeId, providerForKeys);
+  // Runtime-owned secrets (api_key_env_var, e.g. INTEL_API_KEY) apply even when
+  // the LLM provider catalog is suppressed.
+  const providerForKeys = needsLlmProviderSelection ? effectiveProvider : "";
+  const requiredKeys = [
+    ...requiredCredentialEnvKeys(runtimeId, providerForKeys),
+  ];
+  const runtimeApiKey = runtimeApiKeyEnvVar(catalog);
+  if (runtimeApiKey && !requiredKeys.includes(runtimeApiKey)) {
+    requiredKeys.push(runtimeApiKey);
+  }
 
   // Keys satisfied by the baked build env (Block-internal builds only).
   const bakedSatisfiedSet = new Set(

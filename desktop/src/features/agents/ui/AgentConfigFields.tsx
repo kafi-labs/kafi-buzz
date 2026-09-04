@@ -41,11 +41,7 @@ import {
   getProviderApiKeyLabel,
   runtimeSupportsLlmProviderSelection,
 } from "@/features/agents/ui/agentConfigOptions";
-import {
-  AgentConfigTextInput,
-  AgentDropdownSelect,
-  AgentModelField,
-} from "@/features/agents/ui/agentConfigControls";
+import { AgentModelField } from "@/features/agents/ui/agentConfigControls";
 import { PersonaProviderApiKeyField } from "@/features/agents/ui/PersonaProviderApiKeyField";
 import { usePersonaModelDiscovery } from "@/features/agents/ui/usePersonaModelDiscovery";
 import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
@@ -62,7 +58,38 @@ import {
 import { SettingsOptionGroup } from "@/features/settings/ui/SettingsOptionGroup";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
 import { CardMintKeyCue } from "./CardMintKeyCue";
+import {
+  getGlobalCatalogCredentialState,
+  getGlobalCatalogRuntimeFields,
+  globalCatalogRuntimeFieldsAreValid,
+  GlobalCatalogRuntimeDependentFields,
+  GlobalCatalogRuntimeProviderField,
+} from "./AgentConfigCatalogRuntimeFields";
+import {
+  type AgentConfigDisclosure,
+  CANONICAL_CONFIG_BEHAVIORS,
+  resolveDisclosure,
+  shouldRenderModelControl,
+  shouldRevealDependentConfigFields,
+  shouldShowModelStatusMessage,
+} from "./agentConfigFieldsBehavior";
+import { AgentConfigProviderField } from "./AgentConfigProviderField";
 import { getGlobalAgentCredentialState } from "./globalAgentCredentialState";
+
+export {
+  CANONICAL_CONFIG_BEHAVIORS,
+  resolveDisclosure,
+  shouldRenderModelControl,
+  shouldRevealDependentConfigFields,
+  shouldShowModelStatusMessage,
+} from "./agentConfigFieldsBehavior";
+
+const {
+  autoSelectModelOnProviderChange,
+  disableModelSelectDuringDiscovery,
+  preserveCredentialEnvVarsOnProviderChange,
+  requireProviderForModelAndEffort,
+} = CANONICAL_CONFIG_BEHAVIORS;
 
 export const EMPTY_GLOBAL_CONFIG: GlobalAgentConfig = {
   env_vars: {},
@@ -81,95 +108,6 @@ const PROGRESSIVE_FIELDS_TRANSITION = {
   duration: 0.22,
   ease: [0.23, 1, 0.32, 1],
 } as const;
-type AgentConfigDisclosure =
-  | "full"
-  | "onboarding-essential"
-  | "progressive-defaults";
-
-// Canonical behaviors (formerly per-surface props; onboarding's values won
-// every call and are now the only behavior). Design principle #4: require a
-// provider before model/effort are editable; preserve credential env vars
-// across provider switches; auto-select model on provider change.
-const autoSelectModelOnProviderChange = true;
-const disableModelSelectDuringDiscovery = false;
-const preserveCredentialEnvVarsOnProviderChange = true;
-const requireProviderForModelAndEffort = true;
-
-/** The canonical behavior contract, exported for the contract test. */
-export const CANONICAL_CONFIG_BEHAVIORS = {
-  autoSelectModelOnProviderChange,
-  disableModelSelectDuringDiscovery,
-  preserveCredentialEnvVarsOnProviderChange,
-  requireProviderForModelAndEffort,
-} as const;
-
-/** Disclosure preset → the eight visibility decisions it owns. Exported for the contract test. */
-export function resolveDisclosure(disclosure: AgentConfigDisclosure) {
-  const full = disclosure !== "onboarding-essential";
-  return {
-    showAdvancedFields: full,
-    showCustomModelOption: full,
-    showCustomProviderOption: full,
-    showDescriptions: full,
-    showEffortField: true,
-    showProviderPlaceholderOption: full,
-    showRequiredIndicators: full,
-    showUnavailableEffortOptions: full,
-  } as const;
-}
-
-export function shouldRevealDependentConfigFields({
-  disclosure,
-  providerFieldVisible,
-  providerValue,
-}: {
-  disclosure: AgentConfigDisclosure;
-  providerFieldVisible: boolean;
-  providerValue: string;
-}): boolean {
-  return (
-    disclosure !== "progressive-defaults" ||
-    !providerFieldVisible ||
-    providerValue.trim().length > 0
-  );
-}
-
-/** Whether the status line under the Model field renders. Discovery warnings bypass onboarding-essential so first-run failures are never invisible. */
-export function shouldShowModelStatusMessage(
-  showDescriptions: boolean,
-  status: { message: string; tone: string } | null,
-): boolean {
-  return showDescriptions || status !== null;
-}
-
-/**
- * Renders the Model control given discovery state. Optional-model harnesses omit it while
- * discovery is loading or after confirmed successful empty; failures keep it for the #2246 UI.
- */
-export function shouldRenderModelControl({
-  discoveredModelOptions,
-  modelDiscoveryLoading,
-  modelDiscoverySuccessfulEmpty,
-  modelIsOptional,
-  showCustomModelOption,
-}: {
-  discoveredModelOptions: readonly { id: string }[] | null;
-  modelDiscoveryLoading: boolean;
-  /** True only when discovery IPC resolved with a response that yielded no options. */
-  modelDiscoverySuccessfulEmpty: boolean;
-  modelIsOptional: boolean;
-  showCustomModelOption: boolean;
-}): boolean {
-  if (!modelIsOptional) return true;
-  if (modelDiscoveryLoading) return false;
-  const hasExplicitModel = (discoveredModelOptions ?? []).some(
-    (option) => option.id.trim().length > 0,
-  );
-  if (hasExplicitModel) return true;
-  if (showCustomModelOption) return true;
-  // Omit only on confirmed successful empty — not on failure/unavailable.
-  return !modelDiscoverySuccessfulEmpty;
-}
 
 export type AgentConfigFieldsProps = {
   bakedEnv: BakedEnvEntry[];
@@ -246,6 +184,14 @@ export function AgentConfigFields({
       }),
     [config, disclosure, selectedRuntime],
   );
+  // Onboarding cannot select catalog-owned runtimes today. Keep that surface's
+  // established renderer untouched; global defaults honor the catalog's
+  // explicit free-text provider/model descriptors.
+  const catalogRuntimeFields =
+    disclosure === "onboarding-essential"
+      ? null
+      : getGlobalCatalogRuntimeFields(fieldModel);
+  const usesCatalogRuntimeFields = catalogRuntimeFields !== null;
   const effortField = getRenderableEffortField(fieldModel);
   const effortPersistenceKey =
     effortField?.currentPersistence.kind === "envVar"
@@ -313,9 +259,11 @@ export function AgentConfigFields({
     providerFieldVisible && !isCustomProvider
       ? providerValue || bakedProvider || ""
       : "";
-  const configuredProviderValue = isCustomProvider
+  const configuredProviderValue = usesCatalogRuntimeFields
     ? providerValue
-    : providerForDiscovery;
+    : isCustomProvider
+      ? providerValue
+      : providerForDiscovery;
   const dependentFieldsDisabled =
     providerFieldVisible &&
     requireProviderForModelAndEffort &&
@@ -336,6 +284,14 @@ export function AgentConfigFields({
     () => bakedEnv.map((entry) => entry.key),
     [bakedEnv],
   );
+  const catalogCredentialState = catalogRuntimeFields
+    ? getGlobalCatalogCredentialState({
+        bakedEnvKeys,
+        envVars: config.env_vars,
+        fields: catalogRuntimeFields,
+        runtimeFileConfig,
+      })
+    : null;
   const {
     advancedCredentialMissing,
     advancedFileSatisfiedEnvKeys,
@@ -352,8 +308,16 @@ export function AgentConfigFields({
     runtimeFileConfig,
     runtimeId: credentialRuntimeId,
   });
+  const structuredApiKeyEnvVar =
+    catalogCredentialState?.apiKeyEnvVar ?? apiKeyEnvVar;
   const configIsValid =
-    selectedRuntimeId.length > 0 && modelIsValid && credentialsValid;
+    selectedRuntimeId.length > 0 &&
+    (catalogRuntimeFields && catalogCredentialState
+      ? globalCatalogRuntimeFieldsAreValid({
+          credentialState: catalogCredentialState,
+          fields: catalogRuntimeFields,
+        })
+      : modelIsValid && credentialsValid);
   React.useEffect(() => {
     onValidityChange?.(configIsValid);
   }, [configIsValid, onValidityChange]);
@@ -366,7 +330,7 @@ export function AgentConfigFields({
   } = usePersonaModelDiscovery({
     envVars: config.env_vars,
     isCustomProviderEditing: isCustomProvider,
-    modelFieldVisible: !dependentFieldsDisabled,
+    modelFieldVisible: !usesCatalogRuntimeFields && !dependentFieldsDisabled,
     open: true,
     provider: providerForDiscovery,
     selectedRuntime,
@@ -399,6 +363,7 @@ export function AgentConfigFields({
 
   const autoSelectedModelScopeRef = React.useRef<string | null>(null);
   React.useEffect(() => {
+    if (usesCatalogRuntimeFields) return;
     if (!autoSelectModelOnProviderChange) return;
     if (!mayMutateDependentFieldsRef.current) return;
     const trimmedProvider = providerForDiscovery.trim();
@@ -428,6 +393,7 @@ export function AgentConfigFields({
     onCustomModelEditingChange,
     providerForDiscovery,
     selectedRuntimeId,
+    usesCatalogRuntimeFields,
   ]);
 
   const currentEffortForAutoClear = effortPersistenceKey
@@ -439,6 +405,7 @@ export function AgentConfigFields({
   // model unsupported; also clear when Model is omitted after a confirmed empty
   // catalog. Never clear on failure/unavailable — transient errors must not erase.
   React.useEffect(() => {
+    if (usesCatalogRuntimeFields) return;
     if (!healOnMount) return;
     const currentModel = (config.model ?? "").trim();
     if (currentModel.length === 0) return;
@@ -471,6 +438,7 @@ export function AgentConfigFields({
     healOnMount,
     effortPersistenceKey,
     isHarnessNativeEffort,
+    usesCatalogRuntimeFields,
   ]);
 
   // Orphan-model clearing follows the mount-time healing policy above: the
@@ -478,6 +446,7 @@ export function AgentConfigFields({
   // model without a global provider can be deliberate (PR #2148). Evergreen
   // surfaces only clear on explicit edit; onboarding heals on open.
   React.useEffect(() => {
+    if (usesCatalogRuntimeFields) return;
     if (!mayMutateDependentFieldsRef.current) return;
     if (!dependentFieldsDisabled) return;
     // When model is absent, harness-native effort is model-independent so no
@@ -503,6 +472,7 @@ export function AgentConfigFields({
     onCustomModelEditingChange,
     effortPersistenceKey,
     isHarnessNativeEffort,
+    usesCatalogRuntimeFields,
   ]);
   // `useEffortAutoClear` must not delete a valid harness-native value (e.g.
   // "off" for Goose). Suppress it by passing "" as the current effort.
@@ -651,104 +621,45 @@ export function AgentConfigFields({
   const blockClassName = unstyled ? "" : "p-3";
   const fieldLabelClassName =
     unstyled && !progressiveDefaults ? "pl-3" : undefined;
-  const providerDropdownOptions = [
-    ...providerOptions
-      .filter(
-        (opt) =>
-          showProviderPlaceholderOption ||
-          opt.id !== "" ||
-          providerSelectValue === AUTO_PROVIDER_DROPDOWN_VALUE,
-      )
-      .map((opt) => ({
-        label:
-          opt.id === ""
-            ? showProviderPlaceholderOption
-              ? (providerZeroLabel ?? opt.label)
-              : compactProviderZeroLabel
-            : opt.label,
-        value: opt.id || AUTO_PROVIDER_DROPDOWN_VALUE,
-      })),
-    ...(showCustomProviderOption
-      ? [{ label: "Custom provider…", value: CUSTOM_PROVIDER_DROPDOWN_VALUE }]
-      : []),
-  ];
-  const providerSelect = useCustomSelect ? (
-    <AgentDropdownSelect
-      className={selectClassName}
-      id="global-agent-provider"
-      onValueChange={handleProviderChange}
-      options={providerDropdownOptions}
-      placeholder={
-        showProviderPlaceholderOption
-          ? "Select provider"
-          : compactProviderZeroLabel
-      }
-      placeholderClassName={placeholderClassName}
-      placeholderValue={
-        !showProviderPlaceholderOption && !bakedProvider
-          ? AUTO_PROVIDER_DROPDOWN_VALUE
-          : undefined
-      }
-      testId="global-agent-provider"
-      value={providerSelectValue}
-    />
-  ) : (
-    <select
-      className={cn(
-        "flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-xs",
-        useChevronSelectIcon && "appearance-none pr-10",
-        selectClassName,
-      )}
-      id="global-agent-provider"
-      onChange={(e) => handleProviderChange(e.target.value)}
-      value={providerSelectValue}
-    >
-      {providerDropdownOptions.map((option) => (
-        <option key={option.value} value={option.value}>
-          {option.label}
-        </option>
-      ))}
-    </select>
-  );
-
-  const providerContent = providerFieldVisible ? (
-    <div className={fieldClassName}>
-      <label
-        className={cn("text-sm font-medium", fieldLabelClassName)}
-        htmlFor="global-agent-provider"
-      >
-        Provider
-      </label>
-      {!useCustomSelect && useChevronSelectIcon ? (
-        <div className="relative">
-          {providerSelect}
-          <ChevronDown
-            aria-hidden="true"
-            className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-foreground"
-          />
-        </div>
-      ) : (
-        providerSelect
-      )}
-      {isCustomProvider ? (
-        <AgentConfigTextInput
-          aria-label="Custom global provider ID"
-          autoCorrect="off"
-          onChange={(e) => handleCustomProviderInput(e.target.value)}
-          placeholder="Custom provider ID"
-          usePersonaInputStyle={progressiveDefaults}
-          value={providerValue}
-        />
-      ) : null}
-    </div>
-  ) : null;
+  const providerContent =
+    catalogRuntimeFields !== null ? (
+      <GlobalCatalogRuntimeProviderField
+        field={catalogRuntimeFields.providerField}
+        fieldClassName={fieldClassName}
+        fieldLabelClassName={fieldLabelClassName}
+        onValueChange={handleCustomProviderInput}
+        showRequiredIndicator={showRequiredIndicators}
+        usePersonaInputStyle={progressiveDefaults}
+      />
+    ) : providerFieldVisible ? (
+      <AgentConfigProviderField
+        compactProviderZeroLabel={compactProviderZeroLabel}
+        fieldClassName={fieldClassName}
+        fieldLabelClassName={fieldLabelClassName}
+        hasBakedProvider={Boolean(bakedProvider)}
+        isCustomProvider={isCustomProvider}
+        onCustomProviderInput={handleCustomProviderInput}
+        onProviderChange={handleProviderChange}
+        placeholderClassName={placeholderClassName}
+        progressiveDefaults={progressiveDefaults}
+        providerOptions={providerOptions}
+        providerSelectValue={providerSelectValue}
+        providerValue={providerValue}
+        providerZeroLabel={providerZeroLabel}
+        selectClassName={selectClassName}
+        showCustomProviderOption={showCustomProviderOption}
+        showProviderPlaceholderOption={showProviderPlaceholderOption}
+        useChevronSelectIcon={useChevronSelectIcon}
+        useCustomSelect={useCustomSelect}
+      />
+    ) : null;
 
   const advancedEditorBlock = (
     <>
       <EnvVarsEditor
         fileSatisfiedKeys={advancedFileSatisfiedEnvKeys}
         hiddenKeys={[
-          ...(apiKeyEnvVar ? [apiKeyEnvVar] : []),
+          ...(structuredApiKeyEnvVar ? [structuredApiKeyEnvVar] : []),
           ...allStructuredKeys,
         ]}
         inheritedRows={bakedGenericRows}
@@ -772,7 +683,27 @@ export function AgentConfigFields({
 
   const dependentContent = (
     <>
-      {providerFieldVisible && apiKeyEnvVar ? (
+      {catalogRuntimeFields && catalogCredentialState ? (
+        <GlobalCatalogRuntimeDependentFields
+          blockClassName={blockClassName}
+          credentialState={catalogCredentialState}
+          disabled={dependentFieldsDisabled}
+          fieldClassName={fieldClassName}
+          fieldLabelClassName={fieldLabelClassName}
+          fields={catalogRuntimeFields}
+          onApiKeyValueChange={(key, value) =>
+            onConfigChange({
+              ...config,
+              env_vars: { ...config.env_vars, [key]: value },
+            })
+          }
+          onModelValueChange={handleModelChange}
+          showRequiredIndicators={showRequiredIndicators}
+          usePersonaInputStyle={progressiveDefaults}
+        />
+      ) : null}
+
+      {!usesCatalogRuntimeFields && providerFieldVisible && apiKeyEnvVar ? (
         <div className={blockClassName}>
           <PersonaProviderApiKeyField
             disabled={false}
@@ -797,7 +728,7 @@ export function AgentConfigFields({
       ) : null}
 
       {/* Model field — omitted only after confirmed successful empty discovery */}
-      {modelControlVisible ? (
+      {!usesCatalogRuntimeFields && modelControlVisible ? (
         <div className={showDescriptions ? fieldClassName : undefined}>
           <AgentModelField
             allowDefaultModel={fallbackModel !== null}

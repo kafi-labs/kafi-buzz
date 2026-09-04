@@ -92,7 +92,7 @@ pub(super) fn draft_agent_model_discovery_env(
     let mut derived_env = BTreeMap::new();
     if let Some(meta) = known_acp_runtime(agent_command) {
         let provider = provider.map(str::trim).filter(|value| !value.is_empty());
-        if !meta.provider_locked {
+        if meta.inject_provider_env {
             if let (Some(env_key), Some(provider)) = (meta.provider_env_var, provider) {
                 derived_env.insert(env_key.to_string(), provider.to_string());
             }

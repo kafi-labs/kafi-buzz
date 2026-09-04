@@ -106,7 +106,12 @@ pub(crate) struct KnownAcpRuntime {
     pub supports_acp_model_switching: bool,
     pub model_env_var: Option<&'static str>,
     pub provider_env_var: Option<&'static str>,
+    /// Whether the UI suppresses the generic LLM provider catalog for this runtime.
+    /// This does not control whether `provider_env_var` is injected into the child.
     pub provider_locked: bool,
+    /// Whether the effective provider is injected through `provider_env_var`.
+    /// This does not control whether the UI offers a provider catalog.
+    pub inject_provider_env: bool,
     pub default_env: &'static [(&'static str, &'static str)],
     pub config_file_path: Option<&'static str>,
     #[allow(dead_code)] // reserved for format-based dispatch when readers are unified
@@ -156,6 +161,10 @@ pub(crate) struct KnownAcpRuntime {
     /// Human-readable hint shown in Doctor when the runtime is available but not
     /// authenticated. `None` for runtimes that have no login step (goose, buzz-agent).
     pub login_hint: Option<&'static str>,
+    /// Env var for a runtime-owned API secret (not an LLM-provider key).
+    /// When set, create/edit dialogs show a required secret field (e.g. INTEL_API_KEY).
+    /// Distinct from provider catalog keys (ANTHROPIC_API_KEY / OPENAI_API_KEY).
+    pub api_key_env_var: Option<&'static str>,
     /// CLI args for probing authentication status. `args[0]` is the binary name;
     /// the remainder are the subcommand. `None` for runtimes with no login step.
     pub auth_probe_args: Option<&'static [&'static str]>,

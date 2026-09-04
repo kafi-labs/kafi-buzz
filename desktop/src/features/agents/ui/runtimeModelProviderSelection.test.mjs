@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -112,6 +113,65 @@ test("runtime change between provider-selection runtimes keeps provider state", 
   });
   assert.equal(next.provider, "anthropic");
   assert.deepEqual(next.envVars, { ANTHROPIC_API_KEY: "sk-1" });
+});
+
+test("runtime switches clear Intel and Claude models in both directions for both dialogs", () => {
+  const dialogs = ["AgentDefinitionDialog", "AgentInstanceEditDialog"];
+  const transitions = [
+    {
+      from: "intel",
+      model: "builder-sandbox-intel-agent",
+      to: "claude",
+    },
+    {
+      from: "claude",
+      model: "claude-sonnet-4",
+      to: "intel",
+    },
+  ];
+
+  for (const dialog of dialogs) {
+    for (const transition of transitions) {
+      const next = selectionOnRuntimeChange(
+        { ...base, model: transition.model },
+        {
+          previousRuntime: transition.from,
+          nextRuntime: transition.to,
+          nextRuntimeCanChooseProvider: false,
+          lockedRuntimeReset: "full",
+        },
+      );
+      assert.equal(
+        next.model,
+        "",
+        `${dialog}: ${transition.from} -> ${transition.to} must clear ${transition.model}`,
+      );
+    }
+  }
+});
+
+test("both runtime dialogs delegate model clearing to the shared transition", () => {
+  for (const file of [
+    "AgentDefinitionDialog.tsx",
+    "AgentInstanceEditDialog.tsx",
+  ]) {
+    const source = readFileSync(new URL(file, import.meta.url), "utf8");
+    const handler = source.slice(
+      source.indexOf("function handleRuntimeDropdownChange"),
+      source.indexOf("function handleProviderDropdownChange"),
+    );
+
+    assert.match(
+      handler,
+      /applySelection\(\s*selectionOnRuntimeChange\(selection,/,
+      `${file} must apply the shared runtime transition`,
+    );
+    assert.match(
+      source,
+      /function applySelection[\s\S]*?setModel\(next\.model\)/,
+      `${file} must apply the transition's cleared model`,
+    );
+  }
 });
 
 // --- selectionOnProviderDropdownChange ---

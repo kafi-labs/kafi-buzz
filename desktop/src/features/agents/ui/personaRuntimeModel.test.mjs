@@ -11,6 +11,10 @@ test("shouldClearModelForRuntimeChange preserves model for first runtime selecti
   assert.equal(shouldClearModelForRuntimeChange("", "goose"), false);
 });
 
+test("empty previous runtime deliberately preserves a freshly loaded Intel model", () => {
+  assert.equal(shouldClearModelForRuntimeChange("", "intel"), false);
+});
+
 test("shouldClearModelForRuntimeChange clears model when switching runtimes", () => {
   assert.equal(shouldClearModelForRuntimeChange("goose", "claude"), true);
 });

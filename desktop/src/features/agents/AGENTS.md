@@ -304,6 +304,15 @@ with a TypeScript lookup table or an id comparison in a component.
 
 17. **Databricks model discovery has one shared catalog authority.** Desktop and ACP call the shared `buzz-agent` discovery library; Desktop passes the effective merged `DATABRICKS_MODEL_FILTER` explicitly, and the library applies it to raw workspace endpoint IDs and Unity Catalog model-service FQNs after the additive union. A successful filtered-empty catalog is authoritative: it stays empty, disables switching, and never falls through to configured or known-model fallback. UC FQNs are catalog data and always use the MLflow Chat Completions route, regardless of family-looking text in their components. Global Defaults preserves the discovered model ID as the selected value while its closed trigger renders the provider-scoped display label; do not force the raw persisted ID over that label.
 
+18. **Provider-locked runtime fields stay catalog-driven across create,
+    instance edit, and global defaults.** All three surfaces derive free-text
+    gateway/model fields and runtime-owned secrets from
+    `deriveAgentConfigFieldModel`; create and instance edit share agent-name
+    roster behavior through `RuntimeAgentNameField`, including its manual
+    fallback. Global defaults intentionally remain free text because their
+    model value can be inherited across runtimes. Do not fork a second
+    runtime-specific picker or infer these fields from a hardcoded runtime id.
+
 ## Channel-only runtime controls
 
 Desktop observer controls identify a channel, not a thread session. The harness
@@ -338,6 +347,9 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
   `shouldRenderModelControl` (successful-empty omit vs failure keep). If this
   fails, you probably reintroduced a per-surface flag or conflated empty with
   failed discovery.
+- `ui/AgentConfigFields.runtimeModes.test.mjs` — provider-locked global
+  defaults render descriptor-owned gateway/API-key/agent fields while the
+  existing LLM-catalog provider/model controls remain unchanged.
 - `ui/usePersonaModelDiscovery.test.mjs` — `synthesizeEmptyDiscoveryStatus`,
   `isCacheableDiscoveryResponse`, `deriveModelDiscoveryPending`,
   `isSuccessfulEmptyDiscovery`. If the "reopen to retry" copy becomes inert

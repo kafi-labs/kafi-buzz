@@ -1045,6 +1045,13 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             max_tokens_env_var: runtime.max_tokens_env_var.map(str::to_string),
             context_limit_env_var: runtime.context_limit_env_var.map(str::to_string),
             max_rounds_env_var: runtime.max_rounds_env_var.map(str::to_string),
+            provider_locked: runtime.provider_locked,
+            required_normalized_fields: runtime
+                .required_normalized_fields
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            api_key_env_var: runtime.api_key_env_var.map(str::to_string),
             install_hint,
             install_instructions_url: install_instructions_url.to_string(),
             can_auto_install,
@@ -1186,6 +1193,9 @@ pub fn discover_acp_runtimes_from(
                 max_tokens_env_var: None,
                 context_limit_env_var: None,
                 max_rounds_env_var: None,
+                provider_locked: false,
+                required_normalized_fields: Vec::new(),
+                api_key_env_var: None,
                 install_hint: def.install_hint.clone(),
                 install_instructions_url: def.install_instructions_url.clone(),
                 // Security line: custom definitions carry no install scripts.

@@ -24,11 +24,17 @@ pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondT
 mod metadata;
 pub(crate) use metadata::{
     apply_agent_display_env, apply_replay_floor_env, child_rust_log_filter, resolve_session_title,
-    runtime_metadata_env_vars, DISPLAY_NAME_ENV_VAR, REPLAY_FLOOR_ENV_VAR, SESSION_TITLE_ENV_VAR,
+    DISPLAY_NAME_ENV_VAR, REPLAY_FLOOR_ENV_VAR, SESSION_TITLE_ENV_VAR,
 };
 
 mod setup_payload;
 use setup_payload::apply_setup_payload_env;
+
+mod metadata_env;
+pub(crate) use metadata_env::{
+    apply_runtime_metadata_env, apply_user_env_with_runtime_metadata_precedence,
+    retain_user_env_not_shadowing_runtime_metadata, runtime_metadata_env_vars,
+};
 
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
@@ -690,15 +696,12 @@ pub fn spawn_agent_child(
         &super::agent_env::baked_build_env(),
     );
     if let Some(meta) = runtime_meta {
-        for (key, value) in runtime_metadata_env_vars(
-            meta.model_env_var,
-            meta.provider_env_var,
-            meta.provider_locked,
+        apply_runtime_metadata_env(
+            &mut command,
+            meta,
             effective_model.as_deref(),
             effective_provider.as_deref(),
-        ) {
-            command.env(key, value);
-        }
+        );
     }
     command.env_remove("BUZZ_ACP_PRIVATE_KEY");
     command.env_remove("BUZZ_ACP_API_TOKEN");
@@ -752,9 +755,13 @@ pub fn spawn_agent_child(
 
     // User env (descriptor.env): fully-layered floor→runtime→definition→global→persona→agent,
     // reserved-key filtered. Written last so user-explicit values win over Buzz-set env.
-    for (key, value) in &descriptor.env {
-        command.env(key, value);
-    }
+    apply_user_env_with_runtime_metadata_precedence(
+        &mut command,
+        runtime_meta,
+        effective_model.as_deref(),
+        effective_provider.as_deref(),
+        &descriptor.env,
+    );
     // Resolve once and stamp the same value onto the snapshot below.
     let acp_session_policy = super::apply_app_acp_session_policy_env(app, &mut command);
 

@@ -31,6 +31,9 @@ function runtime(id, metadata = {}) {
     maxTokensEnvVar: null,
     contextLimitEnvVar: null,
     maxRoundsEnvVar: null,
+    providerLocked: false,
+    requiredNormalizedFields: [],
+    apiKeyEnvVar: null,
     installHint: "",
     installInstructionsUrl: "",
     canAutoInstall: false,
@@ -719,5 +722,87 @@ test("buzz_agent_optionSource_unchanged_still_buzzAgentCatalog", () => {
     field(model, "effort").optionSource,
     "buzzAgentCatalog",
     "buzz-agent optionSource must remain buzzAgentCatalog",
+  );
+});
+
+test("Intel runtime projects free-text gateway + agent name + API key (no LLM catalog)", () => {
+  // Catalog: model_env_var=INTEL_AGENT, provider_env_var=INTEL_GATEWAY_URL,
+  // provider_locked=true, required_normalized_fields=[model,provider],
+  // api_key_env_var=INTEL_API_KEY. LLM Anthropic/OpenAI dropdowns suppressed.
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      model: "buzz-e2e-assistant",
+      provider: "https://intel-platform.exe.xyz",
+      env_vars: { INTEL_API_KEY: "intel_test" },
+    },
+    runtime: runtime("intel", {
+      label: "Intelligence Platform",
+      modelEnvVar: "INTEL_AGENT",
+      providerEnvVar: "INTEL_GATEWAY_URL",
+      providerLocked: true,
+      requiredNormalizedFields: ["model", "provider"],
+      apiKeyEnvVar: "INTEL_API_KEY",
+      thinkingEnvVar: null,
+    }),
+    scope: "definition",
+  });
+
+  assert.deepEqual(
+    model.fields.map((item) => item.kind),
+    ["provider", "model", "apiKey"],
+  );
+  assert.equal(field(model, "provider").mode, "freeText");
+  assert.equal(field(model, "provider").label, "Gateway URL");
+  assert.equal(field(model, "provider").required, true);
+  assert.deepEqual(field(model, "provider").targetApplication, {
+    kind: "envVar",
+    key: "INTEL_GATEWAY_URL",
+  });
+  assert.equal(
+    field(model, "provider").value,
+    "https://intel-platform.exe.xyz",
+  );
+  assert.equal(field(model, "model").mode, "freeText");
+  assert.equal(field(model, "model").label, "Agent name");
+  assert.equal(field(model, "model").required, true);
+  assert.deepEqual(field(model, "model").targetApplication, {
+    kind: "envVar",
+    key: "INTEL_AGENT",
+  });
+  assert.equal(field(model, "model").value, "buzz-e2e-assistant");
+  assert.equal(field(model, "apiKey").label, "API key");
+  assert.deepEqual(field(model, "apiKey").targetApplication, {
+    kind: "envVar",
+    key: "INTEL_API_KEY",
+  });
+  assert.equal(field(model, "apiKey").value, "intel_test");
+  // No effort control for intel.
+  assert.deepEqual(model.omissions, [
+    { kind: "effort", reason: "unsupportedByHarness" },
+  ]);
+});
+
+test("runtimeSupportsLlmProviderSelection uses catalog providerLocked (intel false)", async () => {
+  const { runtimeSupportsLlmProviderSelection } = await import(
+    "./agentConfigCore.ts"
+  );
+  assert.equal(
+    runtimeSupportsLlmProviderSelection(
+      runtime("intel", {
+        providerEnvVar: "INTEL_GATEWAY_URL",
+        providerLocked: true,
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    runtimeSupportsLlmProviderSelection(
+      runtime("goose", {
+        providerEnvVar: "GOOSE_PROVIDER",
+        providerLocked: false,
+      }),
+    ),
+    true,
   );
 });

@@ -233,7 +233,7 @@ fn resolve_effective_agent_env_with_def(
         for (key, value) in super::runtime::runtime_metadata_env_vars(
             rt.model_env_var,
             rt.provider_env_var,
-            rt.provider_locked,
+            rt.inject_provider_env,
             effective_model.as_deref(),
             effective_provider.as_deref(),
         ) {
@@ -256,16 +256,28 @@ fn resolve_effective_agent_env_with_def(
     // Injected before persona/agent so per-agent values win on collision.
     // `merged_user_env` with an empty "lower" map applies reserved/malformed-key
     // filtering to the global map for free.
-    let global_env = merged_user_env(&BTreeMap::new(), &global.env_vars);
+    let mut global_env = merged_user_env(&BTreeMap::new(), &global.env_vars);
+    super::runtime::retain_user_env_not_shadowing_runtime_metadata(
+        &mut global_env,
+        runtime,
+        effective_model.as_deref(),
+        effective_provider.as_deref(),
+    );
     env.extend(global_env);
 
     // Layer 3b: merged user env — live persona env under the record's own
     // overrides (last-wins), after reserved/malformed-key filtering. Reading
     // the persona live is what makes persona credential edits refresh on the
     // next spawn instead of being frozen into the record.
-    let user_env = merged_user_env(
+    let mut user_env = merged_user_env(
         &super::env_vars::live_persona_env(personas, record.persona_id.as_deref()),
         &record.env_vars,
+    );
+    super::runtime::retain_user_env_not_shadowing_runtime_metadata(
+        &mut user_env,
+        runtime,
+        effective_model.as_deref(),
+        effective_provider.as_deref(),
     );
     env.extend(user_env);
 
@@ -1060,6 +1072,7 @@ mod tests {
             model_env_var: None,
             provider_env_var: None,
             provider_locked: false,
+            inject_provider_env: true,
             default_env: &[],
             supports_acp_native_config: false,
             thinking_env_var: None,
@@ -1070,6 +1083,7 @@ mod tests {
             max_rounds_env_var: None,
             required_normalized_fields: &[],
             login_hint: None,
+            api_key_env_var: None,
             auth_probe_args: None,
         }
     }
@@ -1254,6 +1268,7 @@ mod tests {
             model_env_var: None,
             provider_env_var: None,
             provider_locked: false,
+            inject_provider_env: true,
             default_env: &[],
             supports_acp_native_config: false,
             thinking_env_var: None,
@@ -1264,6 +1279,7 @@ mod tests {
             max_rounds_env_var: None,
             required_normalized_fields: &[],
             login_hint: None,
+            api_key_env_var: None,
             auth_probe_args: None,
         }
     }
@@ -1479,93 +1495,6 @@ mod tests {
         assert!(json["setup_copy"].as_str().unwrap().contains("codex login"));
     }
 
-    // ── resolve_effective_agent_env ─────────────────────────────────────────
-
-    #[test]
-    fn resolve_effective_agent_env_user_env_wins_over_structured_fields() {
-        // User env_vars must win over baked defaults; in OSS builds baked map is empty,
-        // so this validates the user-env layer is present in the output.
-        let mut env_vars = BTreeMap::new();
-        env_vars.insert("BUZZ_AGENT_PROVIDER".to_string(), "anthropic".to_string());
-        env_vars.insert(
-            "BUZZ_AGENT_MODEL".to_string(),
-            "claude-opus-4-5".to_string(),
-        );
-        // Minimal record: only the fields resolve_effective_agent_env reads.
-        let record = crate::managed_agents::types::ManagedAgentRecord {
-            description: None,
-            pubkey: "test-pubkey".to_string(),
-            name: "test-agent".to_string(),
-            persona_id: None,
-            private_key_nsec: String::new(),
-            auth_tag: None,
-            relay_url: String::new(),
-            avatar_url: None,
-            acp_command: "buzz-acp".to_string(),
-            agent_command: "buzz-agent".to_string(),
-            agent_command_override: None,
-            agent_args: vec![],
-            mcp_command: String::new(),
-            turn_timeout_seconds: 320,
-            idle_timeout_seconds: None,
-            max_turn_duration_seconds: None,
-            parallelism: 1,
-            system_prompt: None,
-            model: None,
-            provider: None,
-            persona_source_version: None,
-            env_vars,
-            start_on_app_launch: false,
-            auto_restart_on_config_change: true,
-            runtime_pid: None,
-            backend: Default::default(),
-            backend_agent_id: None,
-            provider_policy_pending: false,
-            provider_binary_path: None,
-            team_id: None,
-            persona_team_dir: None,
-            persona_name_in_team: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            last_started_at: None,
-            last_stopped_at: None,
-            last_exit_code: None,
-            last_error: None,
-            last_error_code: None,
-            respond_to: Default::default(),
-            respond_to_allowlist: vec![],
-            display_name: None,
-            slug: None,
-            runtime: None,
-            name_pool: Vec::new(),
-            is_builtin: false,
-            is_active: true,
-            shared: false,
-            source_team: None,
-            source_team_persona_slug: None,
-            catalog_source: None,
-            team_catalog_source: None,
-            definition_respond_to: None,
-            definition_respond_to_allowlist: Vec::new(),
-            definition_parallelism: None,
-            relay_mesh: None,
-            effort_level: None,
-        };
-
-        let runtime = known_acp_runtime_exact("buzz-agent");
-        let effective = resolve_effective_agent_env(&record, &[], runtime, &Default::default());
-
-        // User env_vars must be present in the output (last-write-wins).
-        assert_eq!(
-            effective.env.get("BUZZ_AGENT_PROVIDER").map(String::as_str),
-            Some("anthropic")
-        );
-        assert_eq!(
-            effective.env.get("BUZZ_AGENT_MODEL").map(String::as_str),
-            Some("claude-opus-4-5")
-        );
-    }
-
     #[test]
     fn buzz_agent_databricks_v2_with_databricks_model_but_no_buzz_agent_model_is_ready() {
         // The baked buzz-releases env sets DATABRICKS_MODEL but not BUZZ_AGENT_MODEL.
@@ -1710,3 +1639,7 @@ mod tests {
 #[cfg(test)]
 #[path = "readiness_goose_file_config_tests.rs"]
 mod goose_file_config_tests;
+
+#[cfg(test)]
+#[path = "readiness_runtime_metadata_tests.rs"]
+mod runtime_metadata_tests;

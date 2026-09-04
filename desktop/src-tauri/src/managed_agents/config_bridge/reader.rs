@@ -475,7 +475,7 @@ fn build_provider_field(
     is_required: bool,
     tiers: &InheritedConfigTiers,
 ) -> Option<NormalizedField> {
-    if provider_locked {
+    if provider_locked && provider_env_var.is_none() {
         return Some(NormalizedField {
             value: Some("Anthropic (locked)".to_string()),
             origin: ConfigOrigin::HarnessConstraint,
@@ -501,11 +501,11 @@ fn build_provider_field(
     let struct_record = record.provider.as_deref();
 
     let tiers_list: &[(Option<&str>, ConfigOrigin)] = &[
+        (struct_record, ConfigOrigin::BuzzExplicit),
         (rec_env, ConfigOrigin::BuzzExplicit),
         (pers_env, ConfigOrigin::PersonaDefault),
         (glob_env, ConfigOrigin::GlobalDefault),
         (def_env, ConfigOrigin::HarnessDefault),
-        (struct_record, ConfigOrigin::BuzzExplicit),
         (
             tiers.persona_provider.as_deref(),
             ConfigOrigin::PersonaDefault,
