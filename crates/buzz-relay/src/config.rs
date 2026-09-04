@@ -367,6 +367,12 @@ pub struct Config {
     /// Whether the configured web bundle serves Git browser routes in addition
     /// to the public invite landing page. Defaults to false.
     pub serve_git_web_gui: bool,
+    /// Whether the configured web bundle serves the Intelligence console routes.
+    /// Defaults to false — the surface is opt-in per deployment.
+    ///
+    /// This controls only which paths fall through to the SPA shell. The
+    /// console's data access remains subject to the relay's per-kind read auth.
+    pub serve_intel_console: bool,
 }
 
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
@@ -1179,6 +1185,9 @@ impl Config {
         let serve_git_web_gui = std::env::var("BUZZ_SERVE_GIT_WEB_GUI")
             .map(|value| value == "true" || value == "1")
             .unwrap_or(false);
+        let serve_intel_console = std::env::var("BUZZ_SERVE_INTEL_CONSOLE")
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(false);
 
         if let Some(ref dir) = web_dir {
             if !dir.join("index.html").is_file() {
@@ -1257,6 +1266,7 @@ impl Config {
             admin,
             web_dir,
             serve_git_web_gui,
+            serve_intel_console,
         })
     }
 }
@@ -1371,6 +1381,10 @@ mod tests {
             !config.serve_git_web_gui,
             "serve_git_web_gui should default to false"
         );
+        assert!(
+            !config.serve_intel_console,
+            "serve_intel_console should default to false"
+        );
         assert_eq!(
             config.media.s3_addressing_style,
             buzz_media::config::S3AddressingStyle::Path,
@@ -1384,6 +1398,26 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    #[test]
+    fn intel_console_flag_requires_explicit_truthy_value() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_SERVE_INTEL_CONSOLE");
+
+        std::env::set_var("BUZZ_SERVE_INTEL_CONSOLE", "1");
+        let enabled = Config::from_env().expect("config").serve_intel_console;
+
+        std::env::set_var("BUZZ_SERVE_INTEL_CONSOLE", "false");
+        let disabled = Config::from_env().expect("config").serve_intel_console;
+
+        match previous {
+            Some(value) => std::env::set_var("BUZZ_SERVE_INTEL_CONSOLE", value),
+            None => std::env::remove_var("BUZZ_SERVE_INTEL_CONSOLE"),
+        }
+
+        assert!(enabled);
+        assert!(!disabled);
     }
 
     /// Run `Config::from_env()` with the admin variables forced to `values`,

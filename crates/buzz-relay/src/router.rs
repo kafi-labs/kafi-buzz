@@ -162,6 +162,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         let web_index = web_dir.as_ref().map(|dir| dir.join("index.html"));
         let web_files = web_dir.map(ServeDir::new);
         let serve_git_web_gui = state.config.serve_git_web_gui;
+        let serve_intel_console = state.config.serve_intel_console;
         let fallback_state = state.clone();
         let spa_fallback = tower::service_fn(move |req: axum::extract::Request| {
             let admin_index = admin_index.clone();
@@ -191,7 +192,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                     if path.starts_with("/assets/") {
                         return files.oneshot(req).await.map(IntoResponse::into_response);
                     }
-                    if should_serve_spa(path, serve_git_web_gui) {
+                    if should_serve_spa(path, serve_git_web_gui, serve_intel_console) {
                         return Ok(read_spa_index(&index).await);
                     }
                 }
@@ -241,12 +242,21 @@ fn is_invite_landing_path(path: &str) -> bool {
         .is_some_and(|code| !code.is_empty() && !code.contains('/'))
 }
 
-fn should_serve_spa(path: &str, serve_git_web_gui: bool) -> bool {
-    is_invite_landing_path(path) || (serve_git_web_gui && is_git_web_gui_path(path))
+fn should_serve_spa(path: &str, serve_git_web_gui: bool, serve_intel_console: bool) -> bool {
+    is_invite_landing_path(path)
+        || (serve_git_web_gui && is_git_web_gui_path(path))
+        || (serve_intel_console && is_intel_console_path(path))
 }
 
 fn is_git_web_gui_path(path: &str) -> bool {
     path == "/" || path == "/repos" || path.starts_with("/repos/")
+}
+
+/// Intelligence console SPA paths, served only when
+/// `BUZZ_SERVE_INTEL_CONSOLE` is enabled. Route gating does not replace the
+/// relay's per-kind read authorization for console data.
+fn is_intel_console_path(path: &str) -> bool {
+    path == "/intelligence" || path.starts_with("/intelligence/")
 }
 
 async fn read_spa_index(index: &std::path::Path) -> axum::response::Response {
@@ -653,22 +663,37 @@ mod tests {
 
     #[test]
     fn invite_is_always_served_but_git_gui_requires_opt_in() {
-        assert!(should_serve_spa("/invite/payload.mac", false));
-        assert!(should_serve_spa("/invite/payload.mac", true));
-        assert!(!should_serve_spa("/", false));
-        assert!(!should_serve_spa("/repos/example", false));
-        assert!(should_serve_spa("/", true));
-        assert!(should_serve_spa("/repos/example", true));
-        assert!(!should_serve_spa("/arbitrary", true));
+        assert!(should_serve_spa("/invite/payload.mac", false, false));
+        assert!(should_serve_spa("/invite/payload.mac", true, false));
+        assert!(!should_serve_spa("/", false, false));
+        assert!(!should_serve_spa("/repos/example", false, false));
+        assert!(should_serve_spa("/", true, false));
+        assert!(should_serve_spa("/repos/example", true, false));
+        assert!(!should_serve_spa("/arbitrary", true, false));
+    }
+
+    #[test]
+    fn intel_console_paths_are_explicit() {
+        assert!(is_intel_console_path("/intelligence"));
+        assert!(is_intel_console_path("/intelligence/"));
+        assert!(is_intel_console_path("/intelligence/agents/abc123"));
+        assert!(!is_intel_console_path("/intelligencex"));
+        assert!(!is_intel_console_path("/api/intelligence"));
+        assert!(!is_intel_console_path("/"));
     }
 
     /// Relay state serving both bundles: the admin SPA on `admin.example` and
     /// the public SPA on any other host.
-    async fn spa_state(admin_dir: &std::path::Path, web_dir: &std::path::Path) -> Arc<AppState> {
+    async fn spa_state(
+        admin_dir: &std::path::Path,
+        web_dir: &std::path::Path,
+        serve_intel_console: bool,
+    ) -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.web_dir = Some(web_dir.to_path_buf());
+        config.serve_intel_console = serve_intel_console;
         config.admin = Some(crate::config::AdminConfig {
             host: "admin.example".to_string(),
             auth: crate::config::AdminAuth::Disabled,
@@ -1175,12 +1200,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_spa_serves_intelligence_routes_only_when_enabled() {
+        let admin_dir = tempfile::tempdir().expect("admin bundle dir");
+        let web_dir = tempfile::tempdir().expect("public bundle dir");
+        write_bundle(admin_dir.path());
+        write_bundle(web_dir.path());
+
+        let disabled = spa_state(admin_dir.path(), web_dir.path(), false).await;
+        for path in ["/intelligence", "/intelligence/agents/abc123"] {
+            let response = spa_response(disabled.clone(), "public.example", path).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        let enabled = spa_state(admin_dir.path(), web_dir.path(), true).await;
+        for path in ["/intelligence", "/intelligence/agents/abc123"] {
+            let response = spa_response(enabled.clone(), "public.example", path).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        let sibling = spa_response(enabled, "public.example", "/intelligencex").await;
+        assert_eq!(sibling.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn admin_spa_documents_and_assets_carry_the_admin_csp() {
         let admin_dir = tempfile::tempdir().expect("admin bundle dir");
         let web_dir = tempfile::tempdir().expect("public bundle dir");
         write_bundle(admin_dir.path());
         write_bundle(web_dir.path());
-        let state = spa_state(admin_dir.path(), web_dir.path()).await;
+        let state = spa_state(admin_dir.path(), web_dir.path(), false).await;
 
         for path in [
             "/",
@@ -1207,7 +1254,7 @@ mod tests {
         let web_dir = tempfile::tempdir().expect("public bundle dir");
         write_bundle(admin_dir.path());
         write_bundle(web_dir.path());
-        let state = spa_state(admin_dir.path(), web_dir.path()).await;
+        let state = spa_state(admin_dir.path(), web_dir.path(), false).await;
 
         let response = spa_response(state.clone(), "admin.example", "/favicon.svg").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1234,7 +1281,7 @@ mod tests {
         let web_dir = tempfile::tempdir().expect("public bundle dir");
         write_bundle(admin_dir.path());
         write_bundle(web_dir.path());
-        let state = spa_state(admin_dir.path(), web_dir.path()).await;
+        let state = spa_state(admin_dir.path(), web_dir.path(), false).await;
 
         for path in ["/invite/payload.mac", "/assets/app.js"] {
             let response = spa_response(state.clone(), "public.example", path).await;
