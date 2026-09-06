@@ -373,6 +373,14 @@ pub struct Config {
     /// This controls only which paths fall through to the SPA shell. The
     /// console's data access remains subject to the relay's per-kind read auth.
     pub serve_intel_console: bool,
+    /// Whether the configured web bundle serves the chat client routes
+    /// (`/channels`, `/channels/*`, `/dms`, `/dms/*`, `/settings`, `/members`).
+    /// Defaults to false — the surface is opt-in per deployment.
+    ///
+    /// This controls only which paths fall through to the SPA shell. Channel
+    /// and DM data access remains subject to the relay's per-kind read auth
+    /// and NIP-29 `#h` scoping.
+    pub serve_web_client: bool,
 }
 
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
@@ -1188,6 +1196,9 @@ impl Config {
         let serve_intel_console = std::env::var("BUZZ_SERVE_INTEL_CONSOLE")
             .map(|value| value == "true" || value == "1")
             .unwrap_or(false);
+        let serve_web_client = std::env::var("BUZZ_SERVE_WEB_CLIENT")
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(false);
 
         if let Some(ref dir) = web_dir {
             if !dir.join("index.html").is_file() {
@@ -1267,6 +1278,7 @@ impl Config {
             web_dir,
             serve_git_web_gui,
             serve_intel_console,
+            serve_web_client,
         })
     }
 }
