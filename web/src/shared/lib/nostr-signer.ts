@@ -3,6 +3,7 @@ import {
   generateSecretKey,
   getPublicKey,
 } from "nostr-tools/pure";
+import { decode as decodeNip19, nsecEncode } from "nostr-tools/nip19";
 
 export type UnsignedNostrEvent = {
   kind: number;
@@ -103,4 +104,103 @@ export async function signNostrEvent(
     throw new Error("Failed to create the ephemeral browser identity.");
   }
   return signed;
+}
+
+/**
+ * Signing seam for the persistent BuzzClient: NIP-07 extension, a persisted
+ * local key, or a page-lifetime ephemeral key.
+ */
+export interface Signer {
+  /** Hex-encoded public key of the signing identity. */
+  getPublicKey(): Promise<string>;
+  /** Sign an unsigned event template; returns a fully formed Nostr event. */
+  signEvent(event: UnsignedNostrEvent): Promise<SignedNostrEvent>;
+  readonly type: "nip07" | "local" | "ephemeral";
+}
+
+/** Delegates to `window.nostr` (Alby, nos2x, etc.). Throws when unavailable. */
+export class Nip07Signer implements Signer {
+  readonly type = "nip07" as const;
+
+  async getPublicKey(): Promise<string> {
+    const provider = typeof window === "undefined" ? undefined : window.nostr;
+    if (!provider) {
+      throw new Nip07UnavailableError();
+    }
+    return provider.getPublicKey();
+  }
+
+  async signEvent(event: UnsignedNostrEvent): Promise<SignedNostrEvent> {
+    return signNostrEvent(event, { requireNip07: true });
+  }
+}
+
+const LOCAL_NSEC_STORAGE_KEY = "buzz:nsec";
+
+function loadOrCreateLocalSecretKey(): Uint8Array {
+  if (typeof window === "undefined") {
+    return generateSecretKey();
+  }
+  const stored = window.localStorage.getItem(LOCAL_NSEC_STORAGE_KEY);
+  if (stored) {
+    try {
+      const decoded = decodeNip19(stored);
+      if (decoded.type === "nsec") {
+        return decoded.data;
+      }
+    } catch {
+      // Corrupt or foreign value — fall through and mint a fresh identity.
+    }
+  }
+  const fresh = generateSecretKey();
+  window.localStorage.setItem(LOCAL_NSEC_STORAGE_KEY, nsecEncode(fresh));
+  return fresh;
+}
+
+/**
+ * Persistent browser identity: a secret key generated once and stored under
+ * `localStorage["buzz:nsec"]`. Survives reloads without a NIP-07 extension —
+ * the zero-friction path for web onboarding.
+ */
+export class LocalKeySigner implements Signer {
+  readonly type = "local" as const;
+  private readonly secretKey: Uint8Array;
+  private readonly pubkey: string;
+
+  constructor(secretKey?: Uint8Array) {
+    this.secretKey = secretKey ?? loadOrCreateLocalSecretKey();
+    this.pubkey = getPublicKey(this.secretKey);
+  }
+
+  async getPublicKey(): Promise<string> {
+    return this.pubkey;
+  }
+
+  async signEvent(event: UnsignedNostrEvent): Promise<SignedNostrEvent> {
+    return finalizeEvent(event, this.secretKey);
+  }
+}
+
+/**
+ * Page-lifetime key, never persisted — a reload mints a new identity. Shares
+ * the same module-level key as the `signNostrEvent` ephemeral fallback so a
+ * tab has one consistent anonymous identity across both call paths.
+ */
+export class EphemeralSigner implements Signer {
+  readonly type = "ephemeral" as const;
+  private readonly secretKey: Uint8Array;
+  private readonly pubkey: string;
+
+  constructor(secretKey?: Uint8Array) {
+    this.secretKey = secretKey ?? getEphemeralSecretKey();
+    this.pubkey = getPublicKey(this.secretKey);
+  }
+
+  async getPublicKey(): Promise<string> {
+    return this.pubkey;
+  }
+
+  async signEvent(event: UnsignedNostrEvent): Promise<SignedNostrEvent> {
+    return finalizeEvent(event, this.secretKey);
+  }
 }
