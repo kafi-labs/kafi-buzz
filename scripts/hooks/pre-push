@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# Refuse to push:
+#   (a) any ref whose tip TREE contains undisclosed security material, by filename; and
+#   (b) any ref whose push would NEWLY INTRODUCE secret-shaped content, by pattern.
+#
+# WHY THIS EXISTS: kafi-labs/kafi-buzz is a PUBLIC fork of block/buzz. Pushing a branch
+# that carries the intel scope-isolation advisory would publicly disclose an unpatched
+# third-party vulnerability (check (a)). Separately, a public fork is also the wrong
+# place for any private key or credential to leave a laptop, on any branch (check (b)).
+#
+# READ THIS BEFORE "SIMPLIFYING" THE TWO CHECKS INTO ONE SCAN — THEY GUARD DIFFERENT
+# HAZARDS AND DELIBERATELY USE DIFFERENT SCOPES:
+#
+#   (a) advisory-by-filename is TREE-scoped (git ls-tree the whole tip). PRESENCE is
+#       the hazard: a branch that never itself added specs/SECURITY-ADVISORY* still
+#       discloses it if that file is anywhere in the tip tree (e.g. a docs branch cut
+#       off the advisory branch, or a cherry-pick, or a rename). Diff-scoping this
+#       check would miss all of those.
+#
+#   (b) secret-by-content is DIFF-scoped (only commits this push would newly make
+#       reachable from a remote we know about). NEW INTRODUCTION is the hazard, not
+#       presence: block/buzz's own history already ships literal NIP-19 test-vector
+#       private keys and other synthetic secrets as fixtures (verified while building
+#       this check: 10+ files carry full bech32 `nsec1...` strings, e.g.
+#       benchmarks/harbor-buzz-orchestra/testbed/tests/test_keys.py, using the
+#       CANONICAL NIP-19 vector published in the spec itself). Tree-scoping check (b)
+#       would reproduce every one of those fixtures and block essentially every push
+#       in the repo — a hook that cries wolf on its first day gets deleted, and a
+#       deleted hook protects nothing. Diff-scoping means re-pushing material that is
+#       already public via a remote we know about is not treated as a new disclosure.
+#
+# See scripts/hooks/README.md for the full design writeup, the false-positive
+# argument, the override policy, and — importantly — the "Ceiling" section on what
+# this hook does NOT do. In short: this is a local convenience that catches accidents
+# before they leave a laptop. It is not a boundary. `git push --no-verify` skips it
+# entirely, by design, and it only exists in clones that installed it. It is not a
+# substitute for a server-side control.
+#
+# Deliberate advisory disclosure (owner-authorised only, filename check ONLY):
+#   BUZZ_ALLOW_ADVISORY_PUSH=1 git push ...
+# There is no override for the secret-content check. See README "Override policy".
+set -uo pipefail
+
+ADVISORY_PATTERN='specs/(SECURITY-ADVISORY|DISCLOSURE)|specs/UPSTREAM-ISSUE-DRAFTS'
+ZERO_RE='^0{40,}$'
+
+# --- (b1) high-confidence secret indicators -------------------------------------
+# Unambiguous by construction: nothing legitimate produces these shapes by accident.
+# Blocks outright, on ANY occurrence in newly-introduced content, with NO override.
+HC_PATTERN='nsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}'
+HC_PATTERN="${HC_PATTERN}|ncryptsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}"
+HC_PATTERN="${HC_PATTERN}|-----BEGIN (RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"
+HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])intel_[A-Za-z0-9]{16,}"
+HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])sk-[A-Za-z0-9]{20,}"
+HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])gh[pos]_[A-Za-z0-9]{20,}"
+HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])AKIA[0-9A-Z]{16}([^0-9A-Za-z]|$)"
+HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])xox[bpar]-[0-9A-Za-z-]{10,}"
+
+# --- (b2) ambiguous secret-shaped material ---------------------------------------
+# A bare 64-hex or long base64 run is NOT, by itself, evidence of a secret in this
+# repo: Nostr public keys, event ids, and NIP-11 fields are 64-hex and legitimately
+# everywhere. So these only block combined with a secret-shaped variable name on the
+# same line, OR a secret-shaped file name. Deliberately EXCLUDES bare "key" as a
+# trigger word: in this codebase "key" alone names public material as often as
+# private (pubkey, relay key, channel key) — only "private"/"priv" combined with
+# key, or secret/token/credential/password/api_key, name a variable as secret-shaped
+# with acceptable precision. See README "Where the ambiguous line is drawn".
+# Boundary-anchored, not bare character runs: EMPIRICALLY REQUIRED, not a nicety.
+# A bare `[A-Za-z0-9+/]{24,}` also matches ordinary file paths (`/` is in the
+# base64 alphabet, so "services/gateway/app/middleware/auth" is 36 straight
+# base64-class chars) and long camelCase identifiers ("validateApiKeyForFoo..."),
+# both constant in this docs- and code-heavy repo. Verified against
+# feat/intel-acp-adapter's own (huge, legitimate) diff before anchoring: the
+# unanchored version lit up on architecture-doc prose describing tokens/API keys
+# in the abstract, with no actual value present. Anchoring the candidate to
+# look like a VALUE — flanked by quote/assignment/separator punctuation, never
+# by another identifier character or `(` (which would make it a call, not a
+# value) or `/` (path segment) — removes that class of false positive.
+PRE_BOUND='(^|[[:space:]"'"'"'=:,(])'
+POST_BOUND='([[:space:]"'"'"',);]|$)'
+HEX_CORE='[0-9a-fA-F]{32,}'
+B64_CORE='[A-Za-z0-9+]{24,}={0,2}'
+HEX_CANDIDATE="${PRE_BOUND}${HEX_CORE}${POST_BOUND}"
+B64_CANDIDATE="${PRE_BOUND}${B64_CORE}${POST_BOUND}"
+LINE_CONTEXT='(secret|token|passwd|password|credential|priv(ate)?[_-]?key|api[_-]?key|apikey)'
+PATH_CONTEXT='(secret|credential|password|\.env(\.|$)|id_rsa|id_ed25519|\.pem$|\.p12$|\.pfx$|private[_-]?key|priv[_-]?key)'
+
+blocked=0
+
+# is_degenerate: filters obviously-fake placeholders (all-zero, all-f, all-same-char
+# runs) out of the ambiguous bucket. These have zero entropy and are never real
+# secrets; they are extremely common as test/placeholder values (this hook's own
+# ZERO_RE is exactly this shape) and would otherwise be a steady false-positive drip.
+is_degenerate() {
+  printf '%s' "$1" | awk '
+    { c = substr($0, 1, 1); for (i = 2; i <= length($0); i++) if (substr($0, i, 1) != c) { print "no"; exit } }
+    END { if (NR > 0) print "yes" }'
+}
+
+# check_advisory_tree: (a), unchanged from the pre-hardening hook. TREE-scoped.
+check_advisory_tree() {
+  local sha="$1" tree rc hits
+  tree=$(git ls-tree -r --name-only "$sha" 2>&1); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'TREE_ERROR\t%s\n' "$tree"
+    return 2
+  fi
+  hits=$(printf '%s\n' "$tree" | grep -E "$ADVISORY_PATTERN" || true)
+  if [ -n "$hits" ]; then
+    printf 'ADVISORY_HIT\n%s\n' "$hits"
+    return 1
+  fi
+  return 0
+}
+
+# new_commits_for: the diff-scope boundary for (b). Commits reachable from $sha that
+# are NOT already reachable from any remote-tracking ref we know about (--remotes),
+# nor from the specific remote_sha this ref update reports (belt-and-suspenders: a
+# stale/missing remote-tracking ref for THIS branch shouldn't widen the scan beyond
+# what the pre-push contract already told us the remote has). This is intentionally
+# NOT --branches/--all: other LOCAL branches (e.g. one carrying the undisclosed
+# advisory) are not public, so their content must still count as "new" if pushed
+# elsewhere. If --remotes resolves to nothing at all (no remote-tracking refs known
+# to this clone), fail toward scanning MORE, not less: git rev-list ... --not
+# --remotes degrades to "all of local_sha's history", which is conservative
+# (more false positives possible) rather than unsafe (never silently skips scanning).
+new_commits_for() {
+  # NOTE: deliberately no bash arrays here - the macOS system bash resolved by
+  # `#!/usr/bin/env bash` for a raw git hook is 3.2 (GPLv3-avoidance vintage), and
+  # `"${arr[@]}"` on an empty array throws "unbound variable" under `set -u` on
+  # that version. Plain string interpolation instead; shas never contain spaces
+  # or glob metacharacters so word-splitting them is safe.
+  local sha="$1" remote_sha="$2" rc out extra_not=""
+  if [ -n "$remote_sha" ] && ! printf '%s' "$remote_sha" | grep -qE "$ZERO_RE"; then
+    if git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+      extra_not="$remote_sha"
+    fi
+  fi
+  if [ -n "$extra_not" ]; then
+    out=$(git rev-list "$sha" --not --remotes --not "$extra_not" 2>&1); rc=$?
+  else
+    out=$(git rev-list "$sha" --not --remotes 2>&1); rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf 'REVLIST_ERROR\t%s\n' "$out"
+    return 2
+  fi
+  printf '%s' "$out"
+  return 0
+}
+
+# scan_secrets: (b), DIFF-scoped. Scans only ADDED lines across the new-commit set.
+scan_secrets() {
+  local new_commits="$1" patch rc changed_files flagged_files f fpatch fadded cand degenerate
+  local hc_hits="" ambig_hits=""
+
+  if [ -z "$new_commits" ]; then
+    return 0 # nothing new relative to any known remote: nothing to scan.
+  fi
+
+  patch=$(printf '%s\n' "$new_commits" | git diff-tree -p --no-color -r -m --stdin 2>&1); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'DIFF_ERROR\t%s\n' "$patch"
+    return 2
+  fi
+
+  local added
+  added=$(printf '%s\n' "$patch" | grep -E '^\+' | grep -vE '^\+\+\+ ' || true)
+
+  # (b1) high-confidence: any hit anywhere in newly-added content blocks, unconditionally.
+  hc_hits=$(printf '%s\n' "$added" | grep -E "$HC_PATTERN" || true)
+
+  # (b2a) ambiguous, line-context: candidate value + secret-shaped keyword on the same line.
+  ambig_hits=$(printf '%s\n' "$added" \
+    | grep -E "$HEX_CANDIDATE|$B64_CANDIDATE" \
+    | grep -iE "$LINE_CONTEXT" || true)
+  if [ -n "$ambig_hits" ]; then
+    local filtered=""
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      cand=$(printf '%s\n' "$line" | grep -oE "$HEX_CORE|$B64_CORE" | head -1)
+      degenerate=$(is_degenerate "$cand")
+      [ "$degenerate" = "yes" ] && continue
+      filtered="${filtered}${line}"$'\n'
+    done <<<"$ambig_hits"
+    ambig_hits="$filtered"
+  fi
+
+  # (b2b) ambiguous, path-context: file name itself says secret/credential/env/pem/...
+  changed_files=$(printf '%s\n' "$patch" \
+    | grep -E '^diff --git ' \
+    | sed -E 's#^diff --git a/(.*) b/.*#\1#' \
+    | sort -u || true)
+  flagged_files=$(printf '%s\n' "$changed_files" | grep -iE "$PATH_CONTEXT" || true)
+  if [ -n "$flagged_files" ]; then
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      fpatch=$(printf '%s\n' "$new_commits" | git diff-tree -p --no-color -r -m --stdin -- "$f" 2>&1)
+      fadded=$(printf '%s\n' "$fpatch" | grep -E '^\+' | grep -vE '^\+\+\+ ' || true)
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        printf '%s\n' "$line" | grep -qE "$HEX_CANDIDATE|$B64_CANDIDATE" || continue
+        cand=$(printf '%s\n' "$line" | grep -oE "$HEX_CORE|$B64_CORE" | head -1)
+        degenerate=$(is_degenerate "$cand")
+        [ "$degenerate" = "yes" ] && continue
+        ambig_hits="${ambig_hits}${f}: ${line}"$'\n'
+      done <<<"$fadded"
+    done <<<"$flagged_files"
+  fi
+
+  if [ -n "$hc_hits" ]; then
+    printf 'HC_HIT\n%s\n' "$hc_hits"
+    return 1
+  fi
+  if [ -n "$ambig_hits" ]; then
+    printf 'AMBIG_HIT\n%s\n' "$ambig_hits"
+    return 1
+  fi
+  return 0
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # UNKNOWN MUST FAIL, NEVER DEGRADE TO A CLEAN PASS.
+  if [ -z "${local_sha:-}" ]; then
+    blocked=1
+    echo "" >&2
+    echo "BLOCKED: unparseable pre-push input - cannot verify what is being pushed." >&2
+    continue
+  fi
+  printf '%s' "$local_sha" | grep -qE "$ZERO_RE" && continue # deletion publishes nothing
+
+  # --- (a) advisory-by-filename, TREE-scoped, unchanged semantics ---
+  adv_out=$(check_advisory_tree "$local_sha"); adv_rc=$?
+  if [ "$adv_rc" -eq 2 ]; then
+    blocked=1
+    echo "" >&2
+    echo "BLOCKED: $local_ref -> $remote_ref" >&2
+    echo "  Cannot read the tree at $local_sha (unknown treated as unsafe, not clean)." >&2
+    echo "$adv_out" | sed 's/^/    /' >&2
+    continue
+  fi
+  advisory_blocked=0
+  if [ "$adv_rc" -eq 1 ]; then
+    advisory_blocked=1
+    echo "" >&2
+    echo "BLOCKED: $local_ref -> $remote_ref" >&2
+    echo "  This ref carries undisclosed security material (by filename):" >&2
+    printf '%s\n' "$adv_out" | tail -n +2 | sed 's/^/    /' >&2
+  fi
+  if [ "$advisory_blocked" -eq 1 ]; then
+    if [ "${BUZZ_ALLOW_ADVISORY_PUSH:-}" = "1" ]; then
+      echo "  OVERRIDE SET (BUZZ_ALLOW_ADVISORY_PUSH=1) - allowing the advisory-filename block." >&2
+    else
+      blocked=1
+    fi
+  fi
+
+  # --- (b) secret-by-content, DIFF-scoped, no override ---
+  nc_out=$(new_commits_for "$local_sha" "${remote_sha:-}"); nc_rc=$?
+  if [ "$nc_rc" -eq 2 ]; then
+    blocked=1
+    echo "" >&2
+    echo "BLOCKED: $local_ref -> $remote_ref" >&2
+    echo "  Cannot determine what this push would newly introduce (unknown treated as unsafe):" >&2
+    echo "$nc_out" | sed 's/^/    /' >&2
+    continue
+  fi
+  sec_out=$(scan_secrets "$nc_out"); sec_rc=$?
+  if [ "$sec_rc" -eq 2 ]; then
+    blocked=1
+    echo "" >&2
+    echo "BLOCKED: $local_ref -> $remote_ref" >&2
+    echo "  Cannot scan newly-introduced content for secrets (unknown treated as unsafe):" >&2
+    echo "$sec_out" | sed 's/^/    /' >&2
+    continue
+  fi
+  if [ "$sec_rc" -eq 1 ]; then
+    blocked=1
+    kind=$(printf '%s\n' "$sec_out" | head -1)
+    echo "" >&2
+    echo "BLOCKED: $local_ref -> $remote_ref" >&2
+    if [ "$kind" = "HC_HIT" ]; then
+      echo "  This push would newly introduce unambiguous key/credential material:" >&2
+    else
+      echo "  This push would newly introduce a high-entropy value in a secret-shaped context:" >&2
+    fi
+    printf '%s\n' "$sec_out" | tail -n +2 | sed 's/^/    /' >&2
+    echo "  There is no override for this check. Remove the secret, or if this is a" >&2
+    echo "  false positive, rename the variable/file so it no longer reads as secret-shaped." >&2
+  fi
+done
+
+if [ "$blocked" = 1 ]; then
+  cat >&2 <<'MSG'
+
+  kafi-labs/kafi-buzz is PUBLIC. This push was blocked - see the reasons above.
+  This hook only catches accidents; it is not a boundary (scripts/hooks/README.md).
+
+  Deliberate, owner-authorised advisory disclosure ONLY (does not affect secret
+  blocks above):
+      BUZZ_ALLOW_ADVISORY_PUSH=1 git push ...
+MSG
+  exit 1
+fi
+exit 0
