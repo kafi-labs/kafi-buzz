@@ -36,7 +36,11 @@ Two independent checks, run for every ref in the push:
    **newly introduce** key/credential-shaped material — high-confidence
    patterns (bech32 private keys, PEM private-key blocks, known service token
    prefixes) unconditionally, and ambiguous high-entropy hex/base64 only when
-   it appears in a secret-shaped variable or file name.
+   it appears in a secret-shaped variable or file name. This scans **two
+   separate surfaces** over the same newly-introduced commit set: file content
+   (added diff lines) and commit **message** bodies — a secret pasted into a
+   commit message with otherwise-clean file content is caught too, not just
+   one pasted into a file.
 
 ## The scope split — READ THIS BEFORE "SIMPLIFYING" THE TWO CHECKS INTO ONE SCAN
 
@@ -55,8 +59,20 @@ diff-scoped or it reproduces the false-positive blowup above.
 ### Diff-scope predicate, precisely
 
 ```sh
-git rev-list "$local_sha" --not --remotes --not "$remote_sha"   # (remote_sha term added only if it resolves to a known, non-zero commit)
+git rev-list "$local_sha" --not --remotes "$remote_sha"   # (remote_sha term added only if it resolves to a known, non-zero commit)
 ```
+
+**Exactly one `--not` covers every exclusion term — do not add a second one.**
+An earlier version wrote `--not --remotes --not "$remote_sha"`, which looks
+like it excludes both terms but does not: git's `--not` **toggles**
+include/exclude sense for subsequent revision arguments rather than scoping to
+just the next term, so the second `--not` flips back to *include* mode and
+adds `$remote_sha` back as an extra positive tip instead of excluding it.
+Confirmed directly (git 2.50.1): on a 3-commit chain A→B→C with no remotes
+fetched, `git rev-list C --not --remotes --not A` returns all three commits —
+identical to no exclusion at all. The bug was silent (it only ever *widens*
+the scanned set, never narrows it below what `--remotes` already excludes) but
+meant the belt-and-suspenders protection described below never actually fired.
 
 - `--remotes` (all `refs/remotes/**`) is the primary boundary: "already visible
   to something we know about" for **any** remote, not just the one being
@@ -96,20 +112,39 @@ occurrence in newly-introduced content:**
   while still catching real keys — bech32's alphabet already excludes `1`,
   `b`, `i`, `o`, which keeps this from matching ordinary English runs)
 - PEM private-key headers: `-----BEGIN [RSA|DSA|EC|OPENSSH|ENCRYPTED] PRIVATE KEY-----`
-- known service-token prefixes: `intel_`, `sk-`, `ghp_`/`gho_`/`ghs_`,
+- known service-token prefixes: `intel_`, `sk-`, `sk-proj-`, `ghp_`/`gho_`/`ghs_`,
   `AKIA…`, `xoxb-`/`xoxp-`/`xoxa-`/`xoxr-` — each with a word-boundary guard
   and a minimum trailing length, so `desk-lamp`/`task-list`-style English
   hyphenation can't accidentally satisfy `sk-[A-Za-z0-9]{20,}` (the class
   excludes `-`, so a real hyphenated phrase breaks the run; a real token is
-  one unbroken alnum blob)
+  one unbroken alnum blob). `sk-proj-` has its own alternative because OpenAI's
+  now-default key format embeds a hyphen right after the prefix, which would
+  otherwise break the classic `sk-` pattern's contiguous-alnum run before it
+  reaches its 20-char minimum.
+  - **Cost, not just the fix**: this list is prefixes we know about today. A
+    future vendor token format we haven't added (e.g. if OpenAI later ships a
+    hyphenated `sk-svcacct-...` service-account prefix) evades HC_PATTERN
+    exactly like `sk-proj-` did until this fix — same class of gap, not yet
+    closed for formats that don't exist yet. Similarly, each prefix's minimum
+    trailing-length threshold means a **truncated or redacted** copy of a real
+    key (e.g. a log line showing only `nsec1abc...` before truncation) can
+    fall under the threshold and evade unconditional blocking — it may still
+    be caught by the ambiguous bucket below if it also carries a secret-shaped
+    line/path context, but is not guaranteed to be.
 
 **Ambiguous material — a long hex or base64-looking run — blocks only when
 it also looks like a *value*, not prose or an identifier, AND appears in a
 secret-shaped context:**
 
-- *Candidate shape*: `[0-9a-fA-F]{32,}` (hex) or `[A-Za-z0-9+]{24,}={0,2}`
-  (base64, deliberately **without** `/`) — see "Boundary anchoring" below for
-  why the naive version of this was wrong.
+- *Candidate shape*: `[0-9a-fA-F]{32,}` (hex) or `[A-Za-z0-9+/]{24,}={0,2}`
+  (base64, **including** `/`) — see "Boundary anchoring" below for why the
+  naive unanchored version of this was wrong, and why `/` is back in the class.
+  - **Threshold cost**: these are minimums. A real secret whose encoded form
+    is *shorter* than the threshold — a 16-byte value hex-encoded to 32 chars
+    sits right at the boundary; anything genuinely shorter (e.g. a 12-byte
+    value, 24 hex chars) — is invisible to this bucket regardless of context,
+    with no fallback. Short-format tokens (CSRF tokens, short API keys) are
+    the concrete shape this misses.
 - *Context* (either is sufficient):
   - **Line context**: the same line names a secret-shaped variable —
     `secret`, `token`, `password`/`passwd`, `credential`,
@@ -120,34 +155,75 @@ secret-shaped context:**
     name a variable as secret-shaped with acceptable precision. Verified: a
     64-hex value assigned to `relay_pubkey =` does **not** trip this; the
     same value assigned to `secret_token =` does.
+    - **Cost**: this also means a variable named just `signing_key`,
+      `encryption_key`, or `stripe_key` — real secrets, but named with bare
+      "key" rather than a private/priv/secret/token/credential/password/api_key
+      qualifier — does **not** trip line context. Such a value is caught only
+      if the file itself matches path context below, or the value shape
+      itself is an HC_PATTERN hit. This is an accepted, not incidental,
+      trade — the false-positive rate of bare "key" in this Nostr-heavy
+      codebase (`pubkey`/`relay_key`/`channel_key` are constant) was worse.
   - **Path context**: the file name itself says `secret`, `credential`,
     `password`, `.env`, `id_rsa`, `id_ed25519`, `.pem`, `.p12`, `.pfx`, or
     `private_key`/`priv_key`.
+    - **Cost**: an ordinary filename that doesn't contain one of these words —
+      `config.yml`, `settings.py`, `docker-compose.yml` — gets no path-context
+      boost even when it embeds real credentials. Such a file's secrets are
+      caught only via line context on the specific line, not by virtue of the
+      file itself looking secret-shaped.
 - *Degenerate-value filter*: a candidate that's a single repeated character
   (all-zero, all-`f`, etc.) is never flagged even in a secret-shaped context.
   These are common, zero-entropy placeholders (this hook's own all-zero sha
   check is exactly this shape) and would otherwise be a steady drip of false
   positives.
+  - **Cost/scope**: this filter is narrow by design — it only recognizes a
+    *single repeated character* across the whole candidate. It does **not**
+    filter other low-entropy-but-varied placeholder shapes (a sequential run
+    like `0123456789abcdef0123456789abcdef`, a keyboard-walk like
+    `abcdefghijklmnopqrstuvwx`), so those remain flagged rather than silently
+    dropped — a deliberate asymmetry: it is cheap to be sure a value is
+    degenerate (repeated-char), much harder to be sure it is meaningfully
+    "placeholder-like" in general, so the filter only trims the case it can
+    prove is safe to drop.
 - **There is no override for either bucket.** See "Override policy" below.
 
 ### Boundary anchoring (why the candidate patterns aren't a bare character-run)
 
 The first version of this hook used bare `[A-Za-z0-9+/]{24,}` for the base64
-candidate. Tested against `feat/intel-acp-adapter`'s own (large, legitimate)
-diff before shipping, it lit up repeatedly on **architecture-doc prose that
-never contained a value at all** — because `/` is part of the base64
-alphabet, so a path like `services/gateway/app/middleware/auth.py` is 36
-straight base64-class characters, and a descriptive sentence containing the
-word "token" or "API keys" nearby turned that into an "ambiguous hit." The
-same shape also matches long camelCase identifiers in code
-(`validateApiKeyForWorkspace...`).
+candidate, with no context gate at all. Tested against
+`feat/intel-acp-adapter`'s own (large, legitimate) diff before shipping, it
+lit up repeatedly on **architecture-doc prose that never contained a value at
+all** — because `/` is part of the base64 alphabet, so a path like
+`services/gateway/app/middleware/auth.py` is 36 straight base64-class
+characters, and a descriptive sentence containing the word "token" or "API
+keys" nearby turned that into an "ambiguous hit." The same shape also matches
+long camelCase identifiers in code (`validateApiKeyForWorkspace...`).
 
-The fix: candidates must be **flanked by punctuation that marks a value**,
-not by another identifier character, a `/` (path separator), or a `(`
-(which would make it a call, not a value):
+The fix that shipped first: candidates must be **flanked by punctuation that
+marks a value**, not by another identifier character or a `(` (which would
+make it a call, not a value):
 
 - allowed before: start-of-line, whitespace, `"`, `'`, `=`, `:`, `,`, `(`
 - allowed after: end-of-line, whitespace, `"`, `'`, `,`, `)`, `;`
+
+That first fix *also* dropped `/` from the base64 character class itself, as
+a second, independent layer against the same path false-positive — which
+turned out to be a **tradeoff documented on only one side**: it stopped
+flagging paths, but silently stopped *catching* real base64 secrets too,
+since most real base64 secrets (AWS secret access keys, many API secrets)
+contain `/` and fragment into sub-threshold runs without it (see the
+`B64_CORE` comment in the hook itself for the concrete AWS-example repro).
+`/` is back in the character class; boundary anchoring plus the
+LINE_CONTEXT/PATH_CONTEXT gate above are what now carry the entire
+path-false-positive burden, not the character class.
+
+**Residual cost of putting `/` back**: a path-like run that is both
+value-anchored (quoted or assigned, per the boundary rules above) *and* sits
+on a line that also carries a secret-shaped keyword can still false-positive
+— e.g. a code comment quoting a path next to the word "token". This is
+strictly narrower than the original unanchored false-positive rate (a bare
+path is not enough on its own any more; it also needs the keyword), but it is
+not zero, and is the accepted remainder of this trade.
 
 This is checked on the *candidate*, separately from the LINE_CONTEXT keyword
 gate, and only affects whether the ambiguous bucket fires — it does not apply
@@ -203,6 +279,30 @@ and must never be cited as one.**
 - **It protects only people who installed it and did not pass a flag.** That
   is worth having. It is not something anyone should point at and say
   "secrets cannot leave this repo."
+- **Content-shape blind spots are architectural, not bugs to chase.** All
+  scanning here is diff/message text scanned line-by-line with `grep -E`, and
+  that method has a floor:
+  - **A secret split across two lines evades detection entirely.** Both
+    `scan_secrets` (diff added-lines) and `scan_commit_messages` grep one
+    physical line at a time, so a contiguous secret broken across a line
+    boundary — string-literal wrapping, concatenation, an editor's
+    auto-wrap — is invisible to every character-run pattern in either bucket,
+    regardless of how obviously secret-shaped the surrounding context is.
+    **Decision: left on the ceiling, not fixed.** The only real fix is
+    normalizing each diff hunk (or commit-message paragraph) into a single
+    matched stream with hunk/file boundaries correctly tracked so unrelated
+    content never gets spuriously joined — that is a scanner-shape change,
+    not a cheap patch, so it stays disclosed here rather than rushed in.
+  - **Binary blobs and submodule pointers hide content from a diff-based
+    scanner entirely.** A secret embedded in a NUL-containing blob renders in
+    the diff as `Binary files a/... and b/... differ` (no `+` lines at all),
+    and a submodule pointer bump renders as `Subproject commit <sha>` (no
+    file content) — both fully evade `scan_secrets` by construction. This is
+    inherent to any diff-text scanner, not specific to this implementation,
+    and is lower-surprise than the line-based gap above, but it is real and
+    reproducible.
+  - Neither gap has a mitigation in this hook today. Treat both as reasons
+    this is a convenience, not a boundary — see below.
 - A real boundary sits where the pusher has no authority to switch it off:
   server-side push protection, secret scanning on the receiving end (e.g.
   GitHub secret scanning / push protection on kafi-labs/kafi-buzz), or a CI
@@ -239,4 +339,13 @@ GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo 100644,"$blob",scratch/
 tree=$(GIT_INDEX_FILE="$idx" git write-tree)
 commit=$(git commit-tree "$tree" -p main -m "test: planted synthetic secret, never pushed")
 rm -f "$idx"
+```
+
+To exercise `scan_commit_messages` specifically (a synthetic secret in the
+**message**, clean tree), reuse `main`'s own tree and put the synthetic value
+in `-m` instead:
+
+```sh
+commit=$(git commit-tree "$(git rev-parse main^{tree})" -p main \
+  -m "test: oops pasted SYNTHETIC-TEST-VALUE into the message, never pushed")
 ```

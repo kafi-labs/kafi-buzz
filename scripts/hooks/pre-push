@@ -28,6 +28,11 @@
 #       in the repo — a hook that cries wolf on its first day gets deleted, and a
 #       deleted hook protects nothing. Diff-scoping means re-pushing material that is
 #       already public via a remote we know about is not treated as a new disclosure.
+#       Check (b) covers TWO surfaces over that same diff-scoped commit set: file
+#       content (scan_secrets) and commit MESSAGE bodies (scan_commit_messages) — a
+#       secret pasted into a commit message with clean file content is just as much a
+#       new introduction as one pasted into a file, and `git diff-tree -p` never
+#       surfaces message text, so it needs its own pass.
 #
 # See scripts/hooks/README.md for the full design writeup, the false-positive
 # argument, the override policy, and — importantly — the "Ceiling" section on what
@@ -52,6 +57,14 @@ HC_PATTERN="${HC_PATTERN}|ncryptsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}"
 HC_PATTERN="${HC_PATTERN}|-----BEGIN (RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"
 HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])intel_[A-Za-z0-9]{16,}"
 HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])sk-[A-Za-z0-9]{20,}"
+# OpenAI's now-default key format is "sk-proj-<...>": the embedded hyphen after
+# "proj" breaks the classic sk- pattern's contiguous-alnum run before it reaches
+# 20 chars, so it needs its own alternative (hyphen allowed in the trailing run,
+# same word-boundary guard as every other prefix here). Does NOT cover other
+# OpenAI hyphenated prefixes issued after this was written (e.g. a future
+# "sk-svcacct-" service-account format) — see README "Where the ambiguous line
+# is drawn" for the general shape of this class of gap.
+HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])sk-proj-[A-Za-z0-9_-]{10,}"
 HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])gh[pos]_[A-Za-z0-9]{20,}"
 HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])AKIA[0-9A-Z]{16}([^0-9A-Za-z]|$)"
 HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])xox[bpar]-[0-9A-Za-z-]{10,}"
@@ -75,14 +88,50 @@ HC_PATTERN="${HC_PATTERN}|(^|[^A-Za-z0-9_])xox[bpar]-[0-9A-Za-z-]{10,}"
 # in the abstract, with no actual value present. Anchoring the candidate to
 # look like a VALUE — flanked by quote/assignment/separator punctuation, never
 # by another identifier character or `(` (which would make it a call, not a
-# value) or `/` (path segment) — removes that class of false positive.
+# value) — removes that class of false positive.
+#
+# B64_CORE INCLUDES `/`, DELIBERATELY, WITH A KNOWN COST — read before changing:
+# an earlier version of this pattern excluded `/` specifically to avoid path
+# false positives. That exclusion had an undisclosed true-negative cost: most
+# real base64 secrets (AWS secret access keys, many API secrets) contain `/`,
+# so excluding it fragmented exactly those values into sub-24-char runs and
+# silently missed them — verified against AWS's own canonical example,
+# `AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` (40 chars,
+# 2 slashes), the single most common real-world leaked-secret shape, in the
+# single most obvious location. `/` is back in the class; the boundary
+# anchoring above plus the LINE_CONTEXT/PATH_CONTEXT gate below are what now
+# carry the path-false-positive burden instead of the character class.
+# Known residual cost of putting `/` back: a path-like run that is both
+# value-anchored (quoted/assigned) AND sits on a line with a secret-shaped
+# keyword can still false-positive, e.g. a comment line quoting a path next to
+# the word "token" — narrower than the pre-anchoring false-positive rate (needs
+# the keyword too, not just the path), but not zero. See README "Where the
+# ambiguous line is drawn" for the accepted trade.
 PRE_BOUND='(^|[[:space:]"'"'"'=:,(])'
 POST_BOUND='([[:space:]"'"'"',);]|$)'
 HEX_CORE='[0-9a-fA-F]{32,}'
-B64_CORE='[A-Za-z0-9+]{24,}={0,2}'
+B64_CORE='[A-Za-z0-9+/]{24,}={0,2}'
 HEX_CANDIDATE="${PRE_BOUND}${HEX_CORE}${POST_BOUND}"
 B64_CANDIDATE="${PRE_BOUND}${B64_CORE}${POST_BOUND}"
-LINE_CONTEXT='(secret|token|passwd|password|credential|priv(ate)?[_-]?key|api[_-]?key|apikey)'
+# Cost of excluding bare "key": a variable named just e.g. "signing_key",
+# "encryption_key", or "stripe_key" does NOT satisfy LINE_CONTEXT (only
+# private/priv-qualified "key" compounds do) and is caught only if the file
+# also matches PATH_CONTEXT below, or the value itself is an HC_PATTERN hit.
+# Accepted because the false-positive rate of bare "key" (pubkey/relay_key/
+# channel_key are constant in this Nostr codebase) was worse in practice.
+# Word-boundary anchored on BOTH sides (not a bare substring test): without
+# this, "token" as a keyword substring-matches inside ordinary identifiers
+# like "onToken"/"broken"/"tokenizer". This was latent but harmless while
+# B64_CORE excluded `/` (few candidates could form in prose); re-including
+# `/` in B64_CORE (see below) exposed it for real — confirmed against
+# feat/intel-acp-adapter's own diff, where a prose line mentioning
+# "onChunk/onToken" (a slash-joined pair of identifiers, not a value) newly
+# false-positived via this exact substring match before anchoring.
+LINE_CONTEXT='(^|[^A-Za-z])(secret|token|passwd|password|credential|priv(ate)?[_-]?key|api[_-]?key|apikey)([^A-Za-z]|$)'
+# Cost: an ordinary filename that doesn't contain one of these words (e.g.
+# config.yml, settings.py, docker-compose.yml) gets no path-context boost even
+# if it embeds real credentials — such a value is caught only via LINE_CONTEXT
+# on its own line, or an HC_PATTERN hit.
 PATH_CONTEXT='(secret|credential|password|\.env(\.|$)|id_rsa|id_ed25519|\.pem$|\.p12$|\.pfx$|private[_-]?key|priv[_-]?key)'
 
 blocked=0
@@ -124,6 +173,17 @@ check_advisory_tree() {
 # to this clone), fail toward scanning MORE, not less: git rev-list ... --not
 # --remotes degrades to "all of local_sha's history", which is conservative
 # (more false positives possible) rather than unsafe (never silently skips scanning).
+#
+# CORRECTNESS NOTE ON THE TWO EXCLUSION TERMS: `--not` in git rev-list TOGGLES
+# include/exclude sense for subsequent revision args — it is not a scoped
+# prefix applying only to the next term. `--not --remotes --not X` therefore
+# does NOT exclude both `--remotes` and `X`: the second `--not` flips back to
+# *include* mode and adds `X` as an extra positive tip, silently cancelling
+# the belt-and-suspenders protection this comment describes (confirmed with
+# git 2.50.1: on a 3-commit chain A->B->C with no remotes fetched, `rev-list C
+# --not --remotes --not A` returns all of A, B, C — identical to no exclusion
+# at all). A single `--not` must cover every exclusion term:
+# `--not --remotes "$extra_not"`, never a second `--not`.
 new_commits_for() {
   # NOTE: deliberately no bash arrays here - the macOS system bash resolved by
   # `#!/usr/bin/env bash` for a raw git hook is 3.2 (GPLv3-avoidance vintage), and
@@ -137,7 +197,7 @@ new_commits_for() {
     fi
   fi
   if [ -n "$extra_not" ]; then
-    out=$(git rev-list "$sha" --not --remotes --not "$extra_not" 2>&1); rc=$?
+    out=$(git rev-list "$sha" --not --remotes "$extra_not" 2>&1); rc=$?
   else
     out=$(git rev-list "$sha" --not --remotes 2>&1); rc=$?
   fi
@@ -149,7 +209,33 @@ new_commits_for() {
   return 0
 }
 
+# hc_hits_in: (b1) applied to an arbitrary blob of newly-introduced text (diff
+# added-lines, or commit-message bodies). Shared so both surfaces use identical
+# high-confidence patterns rather than two copies that can drift apart.
+hc_hits_in() {
+  printf '%s\n' "$1" | grep -E "$HC_PATTERN" || true
+}
+
+# line_context_ambig_hits_in: (b2a) applied to an arbitrary blob of
+# newly-introduced text. Shared for the same reason as hc_hits_in above.
+line_context_ambig_hits_in() {
+  local text="$1" hits line cand degenerate filtered=""
+  hits=$(printf '%s\n' "$text" \
+    | grep -E "$HEX_CANDIDATE|$B64_CANDIDATE" \
+    | grep -iE "$LINE_CONTEXT" || true)
+  [ -z "$hits" ] && return 0
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    cand=$(printf '%s\n' "$line" | grep -oE "$HEX_CORE|$B64_CORE" | head -1)
+    degenerate=$(is_degenerate "$cand")
+    [ "$degenerate" = "yes" ] && continue
+    filtered="${filtered}${line}"$'\n'
+  done <<<"$hits"
+  printf '%s' "$filtered"
+}
+
 # scan_secrets: (b), DIFF-scoped. Scans only ADDED lines across the new-commit set.
+# Does NOT see commit messages - see scan_commit_messages below for that surface.
 scan_secrets() {
   local new_commits="$1" patch rc changed_files flagged_files f fpatch fadded cand degenerate
   local hc_hits="" ambig_hits=""
@@ -168,23 +254,10 @@ scan_secrets() {
   added=$(printf '%s\n' "$patch" | grep -E '^\+' | grep -vE '^\+\+\+ ' || true)
 
   # (b1) high-confidence: any hit anywhere in newly-added content blocks, unconditionally.
-  hc_hits=$(printf '%s\n' "$added" | grep -E "$HC_PATTERN" || true)
+  hc_hits=$(hc_hits_in "$added")
 
   # (b2a) ambiguous, line-context: candidate value + secret-shaped keyword on the same line.
-  ambig_hits=$(printf '%s\n' "$added" \
-    | grep -E "$HEX_CANDIDATE|$B64_CANDIDATE" \
-    | grep -iE "$LINE_CONTEXT" || true)
-  if [ -n "$ambig_hits" ]; then
-    local filtered=""
-    while IFS= read -r line; do
-      [ -z "$line" ] && continue
-      cand=$(printf '%s\n' "$line" | grep -oE "$HEX_CORE|$B64_CORE" | head -1)
-      degenerate=$(is_degenerate "$cand")
-      [ "$degenerate" = "yes" ] && continue
-      filtered="${filtered}${line}"$'\n'
-    done <<<"$ambig_hits"
-    ambig_hits="$filtered"
-  fi
+  ambig_hits=$(line_context_ambig_hits_in "$added")
 
   # (b2b) ambiguous, path-context: file name itself says secret/credential/env/pem/...
   changed_files=$(printf '%s\n' "$patch" \
@@ -207,6 +280,42 @@ scan_secrets() {
       done <<<"$fadded"
     done <<<"$flagged_files"
   fi
+
+  if [ -n "$hc_hits" ]; then
+    printf 'HC_HIT\n%s\n' "$hc_hits"
+    return 1
+  fi
+  if [ -n "$ambig_hits" ]; then
+    printf 'AMBIG_HIT\n%s\n' "$ambig_hits"
+    return 1
+  fi
+  return 0
+}
+
+# scan_commit_messages: (b), DIFF-scoped like scan_secrets (same new-commit set,
+# same "new introduction" hazard) but a SEPARATE surface: `git diff-tree -p`
+# never includes commit message text, so scan_secrets is structurally blind to
+# a secret pasted into a commit message with otherwise-clean file content. Uses
+# the same HC_PATTERN and line-context ambiguous bucket as scan_secrets (via the
+# shared hc_hits_in/line_context_ambig_hits_in helpers) so a secret is caught
+# the same way regardless of which surface it landed in. No path-context (b2b)
+# equivalent here: a commit message has no filename to match PATH_CONTEXT against.
+scan_commit_messages() {
+  local new_commits="$1" msgs rc
+  local hc_hits="" ambig_hits=""
+
+  if [ -z "$new_commits" ]; then
+    return 0 # nothing new relative to any known remote: nothing to scan.
+  fi
+
+  msgs=$(printf '%s\n' "$new_commits" | git log --no-walk --format='%B' --stdin 2>&1); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'MSG_ERROR\t%s\n' "$msgs"
+    return 2
+  fi
+
+  hc_hits=$(hc_hits_in "$msgs")
+  ambig_hits=$(line_context_ambig_hits_in "$msgs")
 
   if [ -n "$hc_hits" ]; then
     printf 'HC_HIT\n%s\n' "$hc_hits"
@@ -287,6 +396,31 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     printf '%s\n' "$sec_out" | tail -n +2 | sed 's/^/    /' >&2
     echo "  There is no override for this check. Remove the secret, or if this is a" >&2
     echo "  false positive, rename the variable/file so it no longer reads as secret-shaped." >&2
+  fi
+
+  # --- (b) secret-by-content in COMMIT MESSAGES, same diff-scope, no override ---
+  msg_out=$(scan_commit_messages "$nc_out"); msg_rc=$?
+  if [ "$msg_rc" -eq 2 ]; then
+    blocked=1
+    echo "" >&2
+    echo "BLOCKED: $local_ref -> $remote_ref" >&2
+    echo "  Cannot scan newly-introduced commit messages for secrets (unknown treated as unsafe):" >&2
+    echo "$msg_out" | sed 's/^/    /' >&2
+    continue
+  fi
+  if [ "$msg_rc" -eq 1 ]; then
+    blocked=1
+    kind=$(printf '%s\n' "$msg_out" | head -1)
+    echo "" >&2
+    echo "BLOCKED: $local_ref -> $remote_ref" >&2
+    if [ "$kind" = "HC_HIT" ]; then
+      echo "  This push would newly introduce unambiguous key/credential material in a commit message:" >&2
+    else
+      echo "  This push would newly introduce a high-entropy value in a secret-shaped context, in a commit message:" >&2
+    fi
+    printf '%s\n' "$msg_out" | tail -n +2 | sed 's/^/    /' >&2
+    echo "  There is no override for this check. Amend the commit message to remove the secret" >&2
+    echo "  (git commit --amend, or an interactive rebase for a non-tip commit) before pushing." >&2
   fi
 done
 
