@@ -11,4 +11,5 @@ export const routes = rootRoute("root.tsx", [
     "/intelligence/agents/$agentPubkey",
     "intelligence.agents.$agentPubkey.tsx",
   ),
+  route("/channels/$channelId", "channels.$channelId.tsx"),
 ]);

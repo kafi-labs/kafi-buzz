@@ -10,6 +10,7 @@ import { Route as intelligenceRouteImport } from "./routes/intelligence";
 import { Route as indexRouteImport } from "./routes/index";
 import { Route as reposDotrepoIdRouteImport } from "./routes/repos.$repoId";
 import { Route as inviteDotcodeRouteImport } from "./routes/invite.$code";
+import { Route as channelsDotchannelIdRouteImport } from "./routes/channels.$channelId";
 import { Route as intelligenceDotagentsDotagentPubkeyRouteImport } from "./routes/intelligence.agents.$agentPubkey";
 import { Route as reposDotrepoIdDotblobDotsplatRouteImport } from "./routes/repos.$repoId.blob.$";
 
@@ -38,6 +39,11 @@ const inviteDotcodeRoute = inviteDotcodeRouteImport.update({
   path: "/invite/$code",
   getParentRoute: () => rootRouteImport,
 } as any);
+const channelsDotchannelIdRoute = channelsDotchannelIdRouteImport.update({
+  id: "/channels/$channelId",
+  path: "/channels/$channelId",
+  getParentRoute: () => rootRouteImport,
+} as any);
 const intelligenceDotagentsDotagentPubkeyRoute =
   intelligenceDotagentsDotagentPubkeyRouteImport.update({
     id: "/intelligence/agents/$agentPubkey",
@@ -55,6 +61,7 @@ export interface FileRoutesByFullPath {
   "/": typeof indexRoute;
   "/intelligence": typeof intelligenceRoute;
   "/repos": typeof reposRoute;
+  "/channels/$channelId": typeof channelsDotchannelIdRoute;
   "/invite/$code": typeof inviteDotcodeRoute;
   "/repos/$repoId": typeof reposDotrepoIdRoute;
   "/intelligence/agents/$agentPubkey": typeof intelligenceDotagentsDotagentPubkeyRoute;
@@ -64,6 +71,7 @@ export interface FileRoutesByTo {
   "/": typeof indexRoute;
   "/intelligence": typeof intelligenceRoute;
   "/repos": typeof reposRoute;
+  "/channels/$channelId": typeof channelsDotchannelIdRoute;
   "/invite/$code": typeof inviteDotcodeRoute;
   "/repos/$repoId": typeof reposDotrepoIdRoute;
   "/intelligence/agents/$agentPubkey": typeof intelligenceDotagentsDotagentPubkeyRoute;
@@ -74,6 +82,7 @@ export interface FileRoutesById {
   "/": typeof indexRoute;
   "/intelligence": typeof intelligenceRoute;
   "/repos": typeof reposRoute;
+  "/channels/$channelId": typeof channelsDotchannelIdRoute;
   "/invite/$code": typeof inviteDotcodeRoute;
   "/repos/$repoId": typeof reposDotrepoIdRoute;
   "/intelligence/agents/$agentPubkey": typeof intelligenceDotagentsDotagentPubkeyRoute;
@@ -85,6 +94,7 @@ export interface FileRouteTypes {
     | "/"
     | "/intelligence"
     | "/repos"
+    | "/channels/$channelId"
     | "/invite/$code"
     | "/repos/$repoId"
     | "/intelligence/agents/$agentPubkey"
@@ -94,6 +104,7 @@ export interface FileRouteTypes {
     | "/"
     | "/intelligence"
     | "/repos"
+    | "/channels/$channelId"
     | "/invite/$code"
     | "/repos/$repoId"
     | "/intelligence/agents/$agentPubkey"
@@ -103,6 +114,7 @@ export interface FileRouteTypes {
     | "/"
     | "/intelligence"
     | "/repos"
+    | "/channels/$channelId"
     | "/invite/$code"
     | "/repos/$repoId"
     | "/intelligence/agents/$agentPubkey"
@@ -113,6 +125,7 @@ export interface RootRouteChildren {
   indexRoute: typeof indexRoute;
   intelligenceRoute: typeof intelligenceRoute;
   reposRoute: typeof reposRoute;
+  channelsDotchannelIdRoute: typeof channelsDotchannelIdRoute;
   inviteDotcodeRoute: typeof inviteDotcodeRoute;
   reposDotrepoIdRoute: typeof reposDotrepoIdRoute;
   intelligenceDotagentsDotagentPubkeyRoute: typeof intelligenceDotagentsDotagentPubkeyRoute;
@@ -156,6 +169,13 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof inviteDotcodeRouteImport;
       parentRoute: typeof rootRouteImport;
     };
+    "/channels/$channelId": {
+      id: "/channels/$channelId";
+      path: "/channels/$channelId";
+      fullPath: "/channels/$channelId";
+      preLoaderRoute: typeof channelsDotchannelIdRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
     "/intelligence/agents/$agentPubkey": {
       id: "/intelligence/agents/$agentPubkey";
       path: "/intelligence/agents/$agentPubkey";
@@ -177,6 +197,7 @@ const rootRouteChildren: RootRouteChildren = {
   indexRoute: indexRoute,
   intelligenceRoute: intelligenceRoute,
   reposRoute: reposRoute,
+  channelsDotchannelIdRoute: channelsDotchannelIdRoute,
   inviteDotcodeRoute: inviteDotcodeRoute,
   reposDotrepoIdRoute: reposDotrepoIdRoute,
   intelligenceDotagentsDotagentPubkeyRoute:
