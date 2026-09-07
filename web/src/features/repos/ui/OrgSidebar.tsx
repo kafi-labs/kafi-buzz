@@ -3,7 +3,7 @@ import { useMemo } from "react";
 
 import type { Repo } from "../use-repos";
 import { ConnectButton } from "./ConnectButton";
-import { PubkeyAvatar } from "./PubkeyAvatar";
+import { PubkeyAvatar } from "@/shared/ui/PubkeyAvatar";
 
 const MAX_AVATARS = 20;
 

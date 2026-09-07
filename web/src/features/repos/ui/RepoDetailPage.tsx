@@ -25,7 +25,7 @@ import {
 import type { CommitInfo, ReadmeResult, TreeEntry } from "../git-client";
 import { useGitTree, useGitLog, useGitReadme } from "../use-git-browse";
 import { ConnectButton } from "./ConnectButton";
-import { PubkeyAvatar } from "./PubkeyAvatar";
+import { PubkeyAvatar } from "@/shared/ui/PubkeyAvatar";
 import { RepoRefsSection } from "./RepoRefsSection";
 import { RepoTreeSection } from "./RepoTreeSection";
 import { RepoCommitsSection } from "./RepoCommitsSection";
