@@ -1,3 +1,5 @@
+import { useBunkerSigner } from "@/shared/context/BunkerSignerContext";
+import { describeBunkerBanner } from "@/shared/lib/bunker-signer";
 import {
   ChatClientProvider,
   useChatClient,
@@ -6,20 +8,40 @@ import { describeConnectionBanner } from "../lib/view-state";
 import { ChannelTimeline } from "./ChannelTimeline";
 import { MessageComposer } from "./MessageComposer";
 
+const TONE_CLASSES: Record<"info" | "warning" | "error", string> = {
+  info: "bg-muted text-muted-foreground",
+  warning: "bg-muted text-muted-foreground",
+  error: "bg-destructive/10 text-destructive",
+};
+
+/**
+ * Two independent axes, each surfaced on its own row: "can I sign?" (bunker
+ * connection — this component) and "may I post?" (relay membership — the
+ * relay ConnectionBanner below it). A user can be bunker-connected but not
+ * enrolled, or enrolled but bunker-disconnected; collapsing those into one
+ * banner would hide which one actually needs fixing.
+ */
+function BunkerBanner() {
+  const { state } = useBunkerSigner();
+  const banner = describeBunkerBanner(state);
+  if (!banner) return null;
+  return (
+    <div
+      className={`px-4 py-1.5 text-center text-xs ${TONE_CLASSES[banner.tone]}`}
+    >
+      {banner.label}
+    </div>
+  );
+}
+
 function ConnectionBanner() {
   const { connectionState, connectionDetail } = useChatClient();
   const banner = describeConnectionBanner(connectionState, connectionDetail);
   if (!banner) return null;
 
-  const toneClasses: Record<typeof banner.tone, string> = {
-    info: "bg-muted text-muted-foreground",
-    warning: "bg-muted text-muted-foreground",
-    error: "bg-destructive/10 text-destructive",
-  };
-
   return (
     <div
-      className={`px-4 py-1.5 text-center text-xs ${toneClasses[banner.tone]}`}
+      className={`px-4 py-1.5 text-center text-xs ${TONE_CLASSES[banner.tone]}`}
     >
       {banner.label}
     </div>
@@ -29,6 +51,7 @@ function ConnectionBanner() {
 function ChannelPageContent({ channelId }: { channelId: string }) {
   return (
     <div className="flex h-dvh flex-col">
+      <BunkerBanner />
       <ConnectionBanner />
       <div className="flex items-center border-b border-border px-4 py-3">
         <h1 className="truncate text-sm font-semibold text-foreground">

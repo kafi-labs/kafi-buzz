@@ -2,6 +2,10 @@ import { SendHorizontal } from "lucide-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
+import {
+  SignerRequestError,
+  describeBunkerBanner,
+} from "@/shared/lib/bunker-signer";
 import { Button } from "@/shared/ui/button";
 import { useChatClient } from "../context/ChatClientContext";
 import { isSendableContent, shouldSubmitOnKeyDown } from "../lib/composer";
@@ -38,9 +42,22 @@ export function MessageComposer({ channelId }: { channelId: string }) {
       // affordance if the publish fails.
       setContent("");
     } catch (error) {
-      toast.error("Message not sent", {
-        description: error instanceof Error ? error.message : "Unknown error.",
-      });
+      if (error instanceof SignerRequestError) {
+        // A signing failure and a relay-publish failure are different
+        // problems with different remedies (retry the signer vs. check the
+        // connection) — the closed set the bunker banner uses becomes the
+        // toast title so they read as distinctly here as anywhere else,
+        // never collapsed into one generic "not sent".
+        toast.error(
+          describeBunkerBanner(error.kind)?.label ?? "Your signer failed.",
+          { description: "Message not sent." },
+        );
+      } else {
+        toast.error("Message not sent", {
+          description:
+            error instanceof Error ? error.message : "Unknown error.",
+        });
+      }
     } finally {
       setIsSending(false);
     }

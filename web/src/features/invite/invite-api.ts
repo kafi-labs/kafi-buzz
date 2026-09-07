@@ -1,4 +1,5 @@
 import { makeNip98AuthHeader } from "@/shared/lib/nip98";
+import type { Signer } from "@/shared/lib/nostr-signer";
 import { relayHttpBaseUrl } from "@/shared/lib/relay-url";
 
 const INVITE_REQUEST_TIMEOUT_MS = 15_000;
@@ -13,9 +14,15 @@ export type BrowserInviteClaim = {
   role: string;
 };
 
+/**
+ * `signer`, when given (a connected NIP-46 bunker), signs the claim
+ * directly and takes priority over `window.nostr` — `requireNip07` still
+ * governs the fallback when no signer is passed, unchanged from before.
+ */
 export async function claimInviteInBrowser(
   code: string,
   policyReceipt?: string,
+  signer?: Signer,
 ): Promise<BrowserInviteClaim> {
   const url = `${relayHttpBaseUrl().replace(/\/+$/, "")}/api/invites/claim`;
   const body = JSON.stringify({
@@ -25,6 +32,7 @@ export async function claimInviteInBrowser(
   const authorization = await makeNip98AuthHeader(url, "POST", {
     body,
     requireNip07: true,
+    signer,
   });
   const response = await fetch(url, {
     method: "POST",
@@ -76,7 +84,9 @@ export function channelIdFromMetadata(event: NostrEventLike): string | null {
  * open channel, so the caller can say so rather than navigating somewhere
  * that will silently fail to post.
  */
-export async function findOpenChannelIdInBrowser(): Promise<string | null> {
+export async function findOpenChannelIdInBrowser(
+  signer?: Signer,
+): Promise<string | null> {
   const url = `${relayHttpBaseUrl().replace(/\/+$/, "")}/query`;
   // The bridge takes a Nostr REQ-style array of filters, ORed together —
   // even a single filter must be wrapped, or it 400s ("invalid type: map,
@@ -85,6 +95,7 @@ export async function findOpenChannelIdInBrowser(): Promise<string | null> {
   const authorization = await makeNip98AuthHeader(url, "POST", {
     body,
     requireNip07: true,
+    signer,
   });
   const response = await fetch(url, {
     method: "POST",

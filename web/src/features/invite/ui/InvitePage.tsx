@@ -9,6 +9,11 @@ import {
   detectBuzzDownloadPlatform,
   resolveBuzzDownloadUrlForPlatform,
 } from "@/shared/lib/buzz-download";
+import { useBunkerSigner } from "@/shared/context/BunkerSignerContext";
+import {
+  SignerRequestError,
+  describeBunkerBanner,
+} from "@/shared/lib/bunker-signer";
 import { hasNip07Provider } from "@/shared/lib/nostr-signer";
 import { relayWsUrl } from "@/shared/lib/relay-url";
 import { Button } from "@/shared/ui/button";
@@ -56,6 +61,16 @@ export function InvitePage({ code }: { code: string }) {
   const [browserJoinError, setBrowserJoinError] = React.useState<string | null>(
     null,
   );
+  const {
+    state: bunkerState,
+    signer: bunkerSigner,
+    connect: connectBunker,
+  } = useBunkerSigner();
+  const [bunkerInput, setBunkerInput] = React.useState("");
+  const [bunkerFormError, setBunkerFormError] = React.useState<string | null>(
+    null,
+  );
+  const [connectingBunker, setConnectingBunker] = React.useState(false);
   const [downloadUrl, setDownloadUrl] = React.useState(BUZZ_RELEASES_URL);
   const [needsMacChoice, setNeedsMacChoice] = React.useState(false);
   const [showMacChoice, setShowMacChoice] = React.useState(false);
@@ -124,11 +139,16 @@ export function InvitePage({ code }: { code: string }) {
     setJoiningBrowser(true);
     try {
       const receipt = await acceptPolicy();
-      await claimInviteInBrowser(code, receipt);
+      // A connected bunker signs directly (no browser-held identity key);
+      // otherwise fall through to the unchanged window.nostr / requireNip07
+      // path inside claimInviteInBrowser.
+      const signer =
+        bunkerState === "connected" ? (bunkerSigner ?? undefined) : undefined;
+      await claimInviteInBrowser(code, receipt, signer);
       // The claim seats relay membership only — never channel membership —
       // so land in an `open` channel, which admits any relay member without
       // a second seating. A `private` target would silently fail to post.
-      const channelId = await findOpenChannelIdInBrowser();
+      const channelId = await findOpenChannelIdInBrowser(signer);
       if (!channelId) {
         setBrowserJoinError(
           "You're a relay member now, but this community has no open channel yet. Ask an admin to add you to one.",
@@ -137,6 +157,15 @@ export function InvitePage({ code }: { code: string }) {
       }
       window.location.assign(`/channels/${channelId}`);
     } catch (error) {
+      if (error instanceof SignerRequestError) {
+        // Same closed set the bunker connection banner uses — "denied" /
+        // "unreachable" / "timed-out" must read distinctly here too, never
+        // collapse into a generic claim-failed message.
+        setBrowserJoinError(
+          describeBunkerBanner(error.kind)?.label ?? error.message,
+        );
+        return;
+      }
       const message =
         error instanceof Error ? error.message : "Could not claim this invite.";
       setBrowserJoinError(inviteClaimErrorMessage(message));
@@ -145,7 +174,30 @@ export function InvitePage({ code }: { code: string }) {
     }
   };
 
-  const browserSigningAvailable = hasNip07Provider();
+  const handleConnectBunker = async (
+    event: React.SubmitEvent<HTMLFormElement>,
+  ) => {
+    event.preventDefault();
+    setBunkerFormError(null);
+    setConnectingBunker(true);
+    try {
+      await connectBunker(bunkerInput);
+    } catch (error) {
+      setBunkerFormError(
+        error instanceof Error
+          ? error.message
+          : "Could not connect to that signer.",
+      );
+    } finally {
+      setConnectingBunker(false);
+    }
+  };
+
+  const bunkerBanner = describeBunkerBanner(bunkerState);
+  const bunkerBusy =
+    bunkerState === "connecting" || bunkerState === "awaiting-approval";
+  const browserSigningAvailable =
+    hasNip07Provider() || bunkerState === "connected";
   const disabled =
     policy === undefined ||
     opening ||
@@ -238,7 +290,60 @@ export function InvitePage({ code }: { code: string }) {
             </div>
           </div>
 
-          <div className="mt-9 w-full max-w-md space-y-2">
+          {bunkerState !== "connected" ? (
+            <form
+              className="mt-9 w-full max-w-md space-y-2 text-left"
+              onSubmit={handleConnectBunker}
+            >
+              <label
+                className="text-sm font-medium text-black"
+                htmlFor="bunker-uri"
+              >
+                Connect a signer to join in browser
+              </label>
+              <div className="flex gap-2">
+                <input
+                  className="h-10 flex-1 rounded-md border border-black/20 px-3 text-sm text-black"
+                  disabled={connectingBunker || bunkerBusy}
+                  id="bunker-uri"
+                  placeholder="bunker://…"
+                  type="text"
+                  value={bunkerInput}
+                  onChange={(event) => setBunkerInput(event.target.value)}
+                />
+                <Button
+                  className="h-10 shrink-0 border border-black bg-white text-black hover:bg-black/5"
+                  disabled={connectingBunker || bunkerBusy || !bunkerInput}
+                  type="submit"
+                >
+                  {bunkerBusy ? "Connecting…" : "Connect"}
+                </Button>
+              </div>
+              {bunkerBanner ? (
+                <p
+                  className={
+                    bunkerBanner.tone === "error"
+                      ? "text-sm text-red-700"
+                      : "text-sm text-black/60"
+                  }
+                  role={bunkerBanner.tone === "error" ? "alert" : undefined}
+                >
+                  {bunkerBanner.label}
+                </p>
+              ) : null}
+              {bunkerFormError ? (
+                <p className="text-sm text-red-700" role="alert">
+                  {bunkerFormError}
+                </p>
+              ) : null}
+            </form>
+          ) : (
+            <p className="mt-9 text-sm text-black/60">
+              Signer connected — ready to join in browser.
+            </p>
+          )}
+
+          <div className="mt-4 w-full max-w-md space-y-2">
             {browserSigningAvailable ? (
               <Button
                 className="h-10 w-full bg-black text-white hover:bg-black/90 focus-visible:ring-black disabled:cursor-not-allowed disabled:bg-black/30 disabled:text-white/70"

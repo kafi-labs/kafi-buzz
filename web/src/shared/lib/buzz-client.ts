@@ -10,6 +10,7 @@
 
 import { makeAuthEvent } from "nostr-tools/nip42";
 import { KINDS } from "@/shared/constants/kinds";
+import { SignerRequestError } from "./bunker-signer";
 import type { Signer } from "./nostr-signer";
 import type {
   ConnectionListener,
@@ -18,6 +19,7 @@ import type {
   NostrFilter,
   PublishAck,
   TimelineListener,
+  UnsignedNostrEvent,
   Unsub,
 } from "./nostr-types";
 import { relayWsUrl } from "./relay-url";
@@ -343,8 +345,32 @@ export class BuzzClient {
       content,
       replyToId,
     });
-    const signed = await this.signer.signEvent(unsigned);
+    const signed = await this.signEvent(unsigned);
     return this.publish(signed);
+  }
+
+  /**
+   * Sign via `this.signer`, always rejecting with a `SignerRequestError` so
+   * a caller (the composer) can tell "signing failed" from "publish failed"
+   * — and why — instead of catching one undifferentiated `Error` for both.
+   * A bunker signer already throws its own classified `kind`; any other
+   * signer's rejection is treated as "denied" — NIP-07/local/ephemeral
+   * signing is otherwise synchronous-in-effect and essentially never fails
+   * except an extension explicitly declining a specific request, which
+   * "denied" describes correctly.
+   */
+  private async signEvent(unsigned: UnsignedNostrEvent): Promise<NostrEvent> {
+    try {
+      return await this.signer.signEvent(unsigned);
+    } catch (error) {
+      if (error instanceof SignerRequestError) throw error;
+      throw new SignerRequestError(
+        "denied",
+        error instanceof Error
+          ? error.message
+          : "Your signer refused to sign this message.",
+      );
+    }
   }
 
   /** Low-level publish of an already-signed event. */
@@ -542,7 +568,7 @@ export class BuzzClient {
     this.setState("authenticating");
     try {
       const template = makeAuthEvent(this.relayUrl, challenge);
-      const signed = await this.signer.signEvent(template);
+      const signed = await this.signEvent(template);
       this.authEventId = signed.id;
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
         this.failConnect(new Error("Socket closed during AUTH"));

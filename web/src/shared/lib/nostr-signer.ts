@@ -107,15 +107,16 @@ export async function signNostrEvent(
 }
 
 /**
- * Signing seam for the persistent BuzzClient: NIP-07 extension, a persisted
- * local key, or a page-lifetime ephemeral key.
+ * Signing seam for the persistent BuzzClient: NIP-07 extension, a NIP-46
+ * remote signer ("bunker" — see `bunker-signer.ts`), a persisted local key,
+ * or a page-lifetime ephemeral key.
  */
 export interface Signer {
   /** Hex-encoded public key of the signing identity. */
   getPublicKey(): Promise<string>;
   /** Sign an unsigned event template; returns a fully formed Nostr event. */
   signEvent(event: UnsignedNostrEvent): Promise<SignedNostrEvent>;
-  readonly type: "nip07" | "local" | "ephemeral";
+  readonly type: "nip07" | "bunker" | "local" | "ephemeral";
 }
 
 /** Delegates to `window.nostr` (Alby, nos2x, etc.). Throws when unavailable. */
