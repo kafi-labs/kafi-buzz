@@ -1,5 +1,8 @@
 import buzzAppIcon from "@/assets/app-icon@3x.png";
-import { claimInviteInBrowser } from "@/features/invite/invite-api";
+import {
+  claimInviteInBrowser,
+  findOpenChannelIdInBrowser,
+} from "@/features/invite/invite-api";
 import {
   BUZZ_RELEASES_URL,
   type BuzzDownloadPlatform,
@@ -122,7 +125,17 @@ export function InvitePage({ code }: { code: string }) {
     try {
       const receipt = await acceptPolicy();
       await claimInviteInBrowser(code, receipt);
-      window.location.assign("/");
+      // The claim seats relay membership only — never channel membership —
+      // so land in an `open` channel, which admits any relay member without
+      // a second seating. A `private` target would silently fail to post.
+      const channelId = await findOpenChannelIdInBrowser();
+      if (!channelId) {
+        setBrowserJoinError(
+          "You're a relay member now, but this community has no open channel yet. Ask an admin to add you to one.",
+        );
+        return;
+      }
+      window.location.assign(`/channels/${channelId}`);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Could not claim this invite.";
