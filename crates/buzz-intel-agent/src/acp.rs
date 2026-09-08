@@ -292,7 +292,17 @@ async fn handle_request(
                             // failure already reported below via a direct
                             // JSON-RPC error, so it must stay silent on the
                             // buzz-channel-reply path (same as a user cancel).
-                            let _ = s.cancel_tx.send(CancelCause::User);
+                            // Routed through `set_cancel_unless_shutdown`,
+                            // not a plain `send`: this session may already
+                            // be mid-shutdown (this is exactly the panic
+                            // path `graceful_shutdown`'s bounded wait exists
+                            // to tolerate) — a panic must not erase a
+                            // `Shutdown` cause `graceful_shutdown` already
+                            // recorded, or the interrupted-turn notice this
+                            // session was owed would be lost the same way
+                            // the reset at the top of `session_prompt` used
+                            // to lose it.
+                            set_cancel_unless_shutdown(&s.cancel_tx, CancelCause::User);
                         }
                     }
                     wire::send(
@@ -467,41 +477,50 @@ async fn cancel_session(app: &Arc<App>, params: Value) {
     }
 }
 
-/// Reset a session's cancel signal at the start of a new turn — without
-/// clobbering a `Shutdown` signal that may have already landed on the
-/// channel.
+/// Write `cause` to a session's cancel channel — unless it already carries
+/// a terminal `Shutdown` signal, which no other writer may overwrite.
 ///
+/// `app.sessions` is a single mutex, and every writer of a session's
+/// `cancel_tx` (this function's two call sites, `cancel_session`'s `User`
+/// send, and `graceful_shutdown`'s `Shutdown` send) holds it for the
+/// duration of its write. That serializes the writers against each other,
+/// but does not order them — whichever one happens to run first wins, and
+/// on a plain `watch` channel (last-write-wins, no compare-and-swap of its
+/// own) "wins" means every earlier write is simply erased. Concretely:
 /// `handle_request` registers a `session/prompt` task in `app.prompt_tasks`
 /// (via `JoinSet::spawn`) before that task is ever polled — `tokio::spawn`
-/// always leaves a scheduling gap between registration and first poll. If
-/// `graceful_shutdown` sends `CancelCause::Shutdown` into that exact gap,
-/// this reset runs next as the very first thing the (now-polled) task does.
-/// `watch` is a last-write-wins channel with no compare-and-swap of its
-/// own, so an unconditional `send(CancelCause::None)` here would silently
-/// erase the shutdown signal: the turn would proceed as if nothing
-/// happened, still get dropped when `graceful_shutdown`'s grace timeout
-/// expires, but the shutdown-interrupted notice this whole mechanism exists
-/// to deliver would never fire. `send_if_modified` locks internally around
-/// the read-modify-write, so this check-then-set is atomic with respect to
-/// a concurrent `graceful_shutdown` send on the same sender — whichever
-/// send actually happens first is the one that determines the outcome, and
-/// a `Shutdown` that got there first always survives.
+/// always leaves a scheduling gap between registration and first poll — so
+/// a `graceful_shutdown` (or, per the panic-recovery call site below, a
+/// panic-handling cleanup) that lands in that gap can be immediately
+/// followed by this session's own write silently discarding it. Guarding
+/// every write through this one function turns that into a real
+/// compare-and-set: `send_if_modified` locks internally around the
+/// read-modify-write, so the check ("is the current value already
+/// `Shutdown`?") and the write are atomic with respect to any concurrent
+/// sender on the same channel, and a `Shutdown` that got there first always
+/// survives regardless of which writer runs next.
 ///
-/// Any other prior value (`None`, or a `User` cancel) is intentionally
-/// still cleared here — see the doc comment on
+/// A prior `None` or `User` value is intentionally still overwritten here
+/// — see the doc comment on
 /// `reset_cancel_for_new_turn_intentionally_still_clobbers_user` for why
-/// `User` deliberately does **not** get the same protection as `Shutdown`,
-/// even though `cancel_session` and this reset race through the exact same
-/// `app.sessions` mutex-ordering shape.
-fn reset_cancel_for_new_turn(cancel_tx: &watch::Sender<CancelCause>) {
+/// `User` deliberately does **not** get the same protection as `Shutdown`
+/// at the `reset_cancel_for_new_turn` call site specifically.
+fn set_cancel_unless_shutdown(cancel_tx: &watch::Sender<CancelCause>, cause: CancelCause) {
     cancel_tx.send_if_modified(|c| {
         if *c == CancelCause::Shutdown {
             false
         } else {
-            *c = CancelCause::None;
+            *c = cause;
             true
         }
     });
+}
+
+/// Reset a session's cancel signal at the start of a new turn. Thin wrapper
+/// over `set_cancel_unless_shutdown` — see that function's doc comment for
+/// the scheduling-gap mechanism this guards against.
+fn reset_cancel_for_new_turn(cancel_tx: &watch::Sender<CancelCause>) {
+    set_cancel_unless_shutdown(cancel_tx, CancelCause::None);
 }
 
 async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
@@ -1545,6 +1564,47 @@ mod tests {
         let (tx, rx) = watch::channel(CancelCause::None);
         reset_cancel_for_new_turn(&tx);
         assert_eq!(*rx.borrow(), CancelCause::None);
+    }
+
+    /// Regression for the second clobbering writer the shutdown-notice fix
+    /// initially missed: `handle_request`'s panic-recovery branch
+    /// (`acp.rs`, inside the `session/prompt` match arm) writes
+    /// `CancelCause::User` after a caught panic, under the same
+    /// `app.sessions` mutex-ordering shape as `reset_cancel_for_new_turn`
+    /// — reachable if a `session/prompt` task panics after
+    /// `graceful_shutdown` already recorded `Shutdown` for it. Binds to
+    /// `set_cancel_unless_shutdown`, the exact function both that call
+    /// site and `reset_cancel_for_new_turn` route through, and proves the
+    /// guard holds regardless of which cause a caller asks to write —
+    /// `Shutdown` must win no matter whether the losing write was a `None`
+    /// reset or a `User` panic-recovery cause.
+    #[test]
+    fn set_cancel_unless_shutdown_protects_shutdown_regardless_of_requested_cause() {
+        for requested in [CancelCause::None, CancelCause::User] {
+            let (tx, rx) = watch::channel(CancelCause::None);
+            tx.send(CancelCause::Shutdown).unwrap();
+
+            set_cancel_unless_shutdown(&tx, requested);
+
+            assert_eq!(
+                *rx.borrow(),
+                CancelCause::Shutdown,
+                "requested cause {requested:?} must not clobber a shutdown signal that arrived first"
+            );
+        }
+    }
+
+    /// Complement: when the channel does *not* already carry `Shutdown`,
+    /// `set_cancel_unless_shutdown` must still actually apply the
+    /// requested cause — a guard that never writes anything would
+    /// vacuously "protect" every value, including this one.
+    #[test]
+    fn set_cancel_unless_shutdown_applies_requested_cause_when_not_shutdown() {
+        for prior in [CancelCause::None, CancelCause::User] {
+            let (tx, rx) = watch::channel(prior);
+            set_cancel_unless_shutdown(&tx, CancelCause::User);
+            assert_eq!(*rx.borrow(), CancelCause::User);
+        }
     }
 
     #[test]
