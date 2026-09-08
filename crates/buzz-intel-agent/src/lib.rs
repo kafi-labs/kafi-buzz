@@ -53,6 +53,13 @@ pub async fn run() -> Result<(), AdapterError> {
         )
         .init();
 
+    // Non-secret startup summary — the operator's only way to confirm the
+    // live spend ceiling (INTEL_MAX_TURNS_PER_WINDOW / INTEL_QUOTA_WINDOW_SECS)
+    // and timeout bounds without reading the secrets-bearing launch script or
+    // inspecting the process environment. `Config::summary` never includes
+    // `api_key`.
+    tracing::info!("buzz-intel-agent starting: {}", cfg.summary());
+
     acp::run_server(cfg).await
 }
 

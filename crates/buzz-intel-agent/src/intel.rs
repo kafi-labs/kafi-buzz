@@ -4,14 +4,14 @@ use std::fmt;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
 use crate::config::Config;
-use crate::error::AdapterError;
+use crate::error::{AdapterError, CancelCause};
 
 /// Parsed SSE / message event kinds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +76,7 @@ pub struct IntelClient {
     api_key: String,
     org_id: Option<String>,
     sse_idle: Duration,
+    response_headers_timeout: Duration,
 }
 
 impl fmt::Debug for IntelClient {
@@ -95,6 +96,7 @@ impl fmt::Debug for IntelClient {
             )
             .field("org_id", &self.org_id)
             .field("sse_idle", &self.sse_idle)
+            .field("response_headers_timeout", &self.response_headers_timeout)
             .finish()
     }
 }
@@ -102,8 +104,24 @@ impl fmt::Debug for IntelClient {
 impl IntelClient {
     /// Build an HTTP client from config.
     pub fn new(cfg: &Config) -> Result<Self, AdapterError> {
-        // No whole-response timeout: SSE streams are long-lived; per-frame idle
-        // is enforced while reading the body.
+        // No whole-response timeout on the `reqwest::Client` itself: SSE
+        // streams are long-lived, and `ClientBuilder::timeout()` would abort
+        // an in-progress stream the moment the clock runs out, which is
+        // exactly what we don't want. Once the body starts streaming,
+        // `sse_idle` bounds per-frame gaps in the read loop instead.
+        //
+        // That reasoning covers the *body*, but "whole response" and "time
+        // to first byte" are different things. `connect_timeout` only bounds
+        // establishing the TCP/TLS connection; once connected, `.send().await`
+        // resolves as soon as response **headers** arrive, and nothing here
+        // bounds that wait. A gateway that accepts the connection and then
+        // stalls before sending headers hangs `.send().await` indefinitely —
+        // observed live: a gateway stalled ~300s before returning 503, and
+        // the adapter waited the whole time (worst case, up to the 3300s
+        // whole-turn bound). `response_headers_timeout` closes that gap: every
+        // `.send().await` call below is wrapped in `tokio::time::timeout`
+        // against it, bounding only the headers phase — the body is still
+        // unbounded here and governed by `sse_idle` once streaming starts.
         let http = reqwest::Client::builder()
             .connect_timeout(cfg.connect_timeout)
             .build()
@@ -114,7 +132,32 @@ impl IntelClient {
             api_key: cfg.api_key.clone(),
             org_id: cfg.org_id.clone(),
             sse_idle: cfg.sse_idle_timeout,
+            response_headers_timeout: cfg.response_headers_timeout,
         })
+    }
+
+    /// Send a request, bounding only the time to receive response **headers**
+    /// (connection already established, request already written) — not the
+    /// whole response. See the doc comment on [`IntelClient::new`] for why
+    /// this is a separate, narrower bound than `sse_idle`.
+    ///
+    /// On expiry this returns a retryable [`AdapterError::Intel`] (the same
+    /// bucket the SSE idle-timeout error uses), consistent with how
+    /// `crate::acp` treats transient intel errors — see the "retry once if no
+    /// SSE frame was received" handling there.
+    async fn send_bounded(
+        &self,
+        req: reqwest::RequestBuilder,
+        context: &str,
+    ) -> Result<reqwest::Response, AdapterError> {
+        match tokio::time::timeout(self.response_headers_timeout, req.send()).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(AdapterError::Intel(format!("{context} connect: {e}"))),
+            Err(_) => Err(AdapterError::Intel(format!(
+                "{context}: timed out waiting for response headers after {}s",
+                self.response_headers_timeout.as_secs()
+            ))),
+        }
     }
 
     fn headers(&self) -> Result<HeaderMap, AdapterError> {
@@ -143,24 +186,32 @@ impl IntelClient {
             .map(str::to_owned)
     }
 
+    /// Parse the gateway's `Retry-After` response header, when present.
+    ///
+    /// Only the delay-seconds form is supported (see [`parse_retry_after_secs`]);
+    /// a missing or unparseable header yields `None`, never a panic or a bogus `0`.
+    fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
+        resp.headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after_secs)
+    }
+
     /// Probe `GET /v1/whoami`.
     pub async fn whoami(&self) -> Result<Value, AdapterError> {
         let url = format!("{}/v1/whoami", self.base);
         let resp = self
-            .http
-            .get(&url)
-            .headers(self.headers()?)
-            .send()
-            .await
-            .map_err(|e| AdapterError::Intel(format!("whoami connect: {e}")))?;
+            .send_bounded(self.http.get(&url).headers(self.headers()?), "whoami")
+            .await?;
         let rid = Self::request_id(&resp);
+        let retry_after = Self::retry_after_secs(&resp);
         let status = resp.status();
         let body = resp
             .text()
             .await
             .map_err(|e| AdapterError::Intel(format!("whoami body: {e}")))?;
         if !status.is_success() {
-            return Err(map_http_error(status, &body, rid.as_deref()));
+            return Err(map_http_error(status, &body, rid.as_deref(), retry_after));
         }
         serde_json::from_str(&body).map_err(|e| AdapterError::Intel(format!("whoami json: {e}")))
     }
@@ -169,20 +220,17 @@ impl IntelClient {
     pub async fn list_agents(&self) -> Result<Value, AdapterError> {
         let url = format!("{}/v1/agents", self.base);
         let resp = self
-            .http
-            .get(&url)
-            .headers(self.headers()?)
-            .send()
-            .await
-            .map_err(|e| AdapterError::Intel(format!("list agents connect: {e}")))?;
+            .send_bounded(self.http.get(&url).headers(self.headers()?), "list agents")
+            .await?;
         let rid = Self::request_id(&resp);
+        let retry_after = Self::retry_after_secs(&resp);
         let status = resp.status();
         let body = resp
             .text()
             .await
             .map_err(|e| AdapterError::Intel(format!("list agents body: {e}")))?;
         if !status.is_success() {
-            return Err(map_http_error(status, &body, rid.as_deref()));
+            return Err(map_http_error(status, &body, rid.as_deref(), retry_after));
         }
         serde_json::from_str(&body)
             .map_err(|e| AdapterError::Intel(format!("list agents json: {e}")))
@@ -227,21 +275,20 @@ impl IntelClient {
             "metadata": { "entity_id": entity_id }
         });
         let resp = self
-            .http
-            .post(&url)
-            .headers(self.headers()?)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AdapterError::Intel(format!("create session connect: {e}")))?;
+            .send_bounded(
+                self.http.post(&url).headers(self.headers()?).json(&body),
+                "create session",
+            )
+            .await?;
         let rid = Self::request_id(&resp);
+        let retry_after = Self::retry_after_secs(&resp);
         let status = resp.status();
         let text = resp
             .text()
             .await
             .map_err(|e| AdapterError::Intel(format!("create session body: {e}")))?;
         if !status.is_success() {
-            return Err(map_http_error(status, &text, rid.as_deref()));
+            return Err(map_http_error(status, &text, rid.as_deref(), retry_after));
         }
         let parsed: CreateSessionResponse = serde_json::from_str(&text)
             .map_err(|e| AdapterError::Intel(format!("create session json: {e}")))?;
@@ -257,13 +304,14 @@ impl IntelClient {
     ///
     /// `on_frame` is invoked for every parsed frame (for ACP session/update emission).
     /// It may be async so callers can await-send wire updates with a short timeout.
-    /// `cancel` aborts the read loop when set to true.
+    /// `cancel` aborts the read loop when set to any cause other than
+    /// [`CancelCause::None`].
     pub async fn send_message_stream<F, Fut>(
         &self,
         session_id: &str,
         message: &str,
         metadata: Value,
-        cancel: &watch::Receiver<bool>,
+        cancel: &watch::Receiver<CancelCause>,
         mut on_frame: F,
     ) -> Result<TurnStreamResult, AdapterError>
     where
@@ -277,15 +325,14 @@ impl IntelClient {
         });
 
         let resp = self
-            .http
-            .post(&url)
-            .headers(self.headers()?)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AdapterError::Intel(format!("send message connect: {e}")))?;
+            .send_bounded(
+                self.http.post(&url).headers(self.headers()?).json(&body),
+                "send message",
+            )
+            .await?;
 
         let rid = Self::request_id(&resp);
+        let retry_after = Self::retry_after_secs(&resp);
         let status = resp.status();
 
         if status == StatusCode::NOT_FOUND || status == StatusCode::CONFLICT {
@@ -309,9 +356,23 @@ impl IntelClient {
                     .unwrap_or_default()
             )));
         }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(AdapterError::IntelRateLimited {
+                retry_after_secs: retry_after,
+                message: format!(
+                    "status {}: {}{}",
+                    status.as_u16(),
+                    summarize_error_body(&text),
+                    rid.as_deref()
+                        .map(|r| format!(" x-request-id={r}"))
+                        .unwrap_or_default()
+                ),
+            });
+        }
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(map_http_error(status, &text, rid.as_deref()));
+            return Err(map_http_error(status, &text, rid.as_deref(), retry_after));
         }
 
         let mut result = TurnStreamResult {
@@ -324,7 +385,7 @@ impl IntelClient {
         let mut cancel = cancel.clone();
 
         loop {
-            if *cancel.borrow() {
+            if *cancel.borrow() != CancelCause::None {
                 return Err(AdapterError::Cancelled);
             }
 
@@ -387,13 +448,13 @@ impl IntelClient {
     }
 }
 
-async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
+async fn wait_for_cancel(cancel: &mut watch::Receiver<CancelCause>) {
     loop {
-        if *cancel.borrow() {
+        if *cancel.borrow() != CancelCause::None {
             return;
         }
         if cancel.changed().await.is_err() {
-            // A closed sender with a false value is not a cancellation signal.
+            // A closed sender left at `None` is not a cancellation signal.
             // Stay pending so the stream read or its idle timeout remains active.
             std::future::pending::<()>().await;
         }
@@ -579,7 +640,17 @@ fn agents_as_array(agents: &Value) -> Result<&Vec<Value>, AdapterError> {
 }
 
 /// Map HTTP status + body into AdapterError (handles both error envelopes).
-pub fn map_http_error(status: StatusCode, body: &str, request_id: Option<&str>) -> AdapterError {
+///
+/// `retry_after_secs` is the already-parsed `Retry-After` header (see
+/// [`parse_retry_after_secs`]); pass `None` when the header was absent, not
+/// present in the delay-seconds form, or not applicable to the call site.
+/// It is only used when `status` is 429.
+pub fn map_http_error(
+    status: StatusCode,
+    body: &str,
+    request_id: Option<&str>,
+    retry_after_secs: Option<u64>,
+) -> AdapterError {
     let summary = summarize_error_body(body);
     let rid = request_id
         .map(|r| format!(" x-request-id={r}"))
@@ -593,7 +664,45 @@ pub fn map_http_error(status: StatusCode, body: &str, request_id: Option<&str>) 
             status.as_u16()
         ));
     }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return AdapterError::IntelRateLimited {
+            retry_after_secs,
+            message: format!("status {}: {summary}{rid}", status.as_u16()),
+        };
+    }
     AdapterError::Intel(format!("status {}: {summary}{rid}", status.as_u16()))
+}
+
+/// Parse a `Retry-After` header value in the **delay-seconds** form (e.g.
+/// `"120"`), per RFC 9110 §10.2.3.
+///
+/// The HTTP-date form (e.g. `"Wed, 21 Oct 2026 07:28:00 GMT"`) is also legal
+/// under the RFC but is treated as absent here rather than parsed: adding a
+/// date/time parser (with its timezone and clock-skew edge cases) is not
+/// worth the risk for a single advisory header on a best-effort retry hint,
+/// and the intel gateway's own delay-seconds usage is what this adapter
+/// needs to act on. Any value that is not a bare non-negative integer —
+/// including an HTTP-date, empty string, or garbage — yields `None`, never
+/// a panic or a bogus `0`.
+pub fn parse_retry_after_secs(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
+}
+
+/// Owner-visible message posted to the channel when the intel gateway itself
+/// refuses a turn with HTTP 429 (upstream backpressure).
+///
+/// Mirrors the tone/shape of [`crate::quota::quota_exceeded_message`] but
+/// names a different cause: that message is *this adapter* refusing a user
+/// against its own outbound turn budget; this one is the *gateway* refusing
+/// a call this adapter already made. Distinguishing the two in the copy
+/// matters — one is a local config knob, the other is upstream capacity.
+pub fn intel_rate_limited_message(retry_after_secs: Option<u64>) -> String {
+    match retry_after_secs {
+        Some(secs) => {
+            format!("⏳ The AI service is busy (rate-limited). Try again in about {secs}s.")
+        }
+        None => "⏳ The AI service is busy (rate-limited). Try again shortly.".to_owned(),
+    }
 }
 
 /// Parse either `{"error":{...}}` or `{"detail":[...]}` (or plain text).
@@ -875,6 +984,7 @@ mod tests {
             api_key: secret.to_string(),
             org_id: Some("debug-org".to_string()),
             sse_idle: Duration::from_secs(42),
+            response_headers_timeout: Duration::from_secs(30),
         };
 
         let debug = format!("{client:?}");
@@ -1110,8 +1220,9 @@ mod tests {
             api_key: "intel_test_key".to_owned(),
             org_id: None,
             sse_idle: Duration::from_secs(5),
+            response_headers_timeout: Duration::from_secs(5),
         };
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(CancelCause::None);
         let first_frame = Arc::new(Notify::new());
         let frame_seen = Arc::clone(&first_frame);
         let turn = tokio::spawn(async move {
@@ -1138,7 +1249,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let cancel_started = tokio::time::Instant::now();
-        cancel_tx.send(true).expect("send cancellation");
+        cancel_tx
+            .send(CancelCause::User)
+            .expect("send cancellation");
         let result = tokio::time::timeout(Duration::from_millis(500), turn)
             .await
             .expect("cancellation waited for the SSE idle timeout")
@@ -1202,6 +1315,7 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             r#"{"error":{"code":"UNAUTHENTICATED","message":"bad key"}}"#,
             Some("rid-1"),
+            None,
         );
         match e {
             AdapterError::IntelAuth(s) => {
@@ -1211,11 +1325,229 @@ mod tests {
             other => panic!("expected IntelAuth, got {other:?}"),
         }
 
-        let e = map_http_error(StatusCode::CONFLICT, r#"{"detail":"stopped"}"#, None);
+        let e = map_http_error(StatusCode::CONFLICT, r#"{"detail":"stopped"}"#, None, None);
         assert!(matches!(e, AdapterError::IntelSessionGone(_)));
 
-        let e = map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", None);
+        let e = map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", None, None);
         assert!(matches!(e, AdapterError::Intel(_)));
+    }
+
+    #[test]
+    fn map_http_error_429_with_retry_after_is_rate_limited() {
+        let e = map_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"RESOURCE_EXHAUSTED","message":"slow down"}}"#,
+            Some("rid-429"),
+            Some(120),
+        );
+        match e {
+            AdapterError::IntelRateLimited {
+                retry_after_secs,
+                message,
+            } => {
+                assert_eq!(retry_after_secs, Some(120));
+                assert!(message.contains("429"));
+                assert!(message.contains("rid-429"));
+                assert!(message.contains("slow down"));
+            }
+            other => panic!("expected IntelRateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_http_error_429_without_retry_after_is_none_not_zero() {
+        let e = map_http_error(StatusCode::TOO_MANY_REQUESTS, "busy", None, None);
+        match e {
+            AdapterError::IntelRateLimited {
+                retry_after_secs, ..
+            } => {
+                assert_eq!(
+                    retry_after_secs, None,
+                    "missing Retry-After must map to None, never a bogus 0"
+                );
+            }
+            other => panic!("expected IntelRateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_secs_delay_seconds_form() {
+        assert_eq!(parse_retry_after_secs("120"), Some(120));
+        assert_eq!(parse_retry_after_secs(" 45 "), Some(45));
+        assert_eq!(parse_retry_after_secs("0"), Some(0));
+    }
+
+    #[test]
+    fn parse_retry_after_secs_unparseable_is_none() {
+        // Garbage.
+        assert_eq!(parse_retry_after_secs("not-a-number"), None);
+        // Empty.
+        assert_eq!(parse_retry_after_secs(""), None);
+        // Negative is not a valid delay-seconds value.
+        assert_eq!(parse_retry_after_secs("-5"), None);
+        // HTTP-date form is legal per RFC 9110 but deliberately not parsed —
+        // treated as absent, per the documented decision on `parse_retry_after_secs`.
+        assert_eq!(
+            parse_retry_after_secs("Wed, 21 Oct 2026 07:28:00 GMT"),
+            None
+        );
+    }
+
+    #[test]
+    fn intel_rate_limited_message_states_wait_when_known() {
+        let m = intel_rate_limited_message(Some(30));
+        assert!(m.contains("30"));
+        assert!(m.to_lowercase().contains("rate-limited") || m.to_lowercase().contains("busy"));
+    }
+
+    #[test]
+    fn intel_rate_limited_message_is_sane_when_unknown() {
+        let m = intel_rate_limited_message(None);
+        assert!(!m.is_empty());
+        assert!(m.to_lowercase().contains("rate-limited") || m.to_lowercase().contains("busy"));
+    }
+
+    /// Build a client that talks to `base` with a short (test-fast)
+    /// `response_headers_timeout` and the given `sse_idle` — bypasses
+    /// `IntelClient::new`/`Config` (private-field construction is legal here
+    /// since `tests` is a submodule of `intel`) so the test doesn't need a
+    /// full `Config` just to override one duration.
+    fn test_client(base: String, response_headers_timeout: Duration) -> IntelClient {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("build reqwest client");
+        IntelClient {
+            http,
+            base,
+            api_key: "test-key".into(),
+            org_id: None,
+            sse_idle: Duration::from_secs(5),
+            response_headers_timeout,
+        }
+    }
+
+    /// Axum handler that never responds within any sane test timeout —
+    /// simulates a gateway that accepted the TCP connection but stalled
+    /// before sending response headers. This is the exact failure mode from
+    /// the live dev-VM incident this timeout guards against: the gateway
+    /// held the connection open for ~300s before eventually returning a 503,
+    /// and `.send().await` — bounded only by (unset) whole-response timeout —
+    /// waited the entire time.
+    async fn hang_forever() -> axum::http::StatusCode {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        axum::http::StatusCode::OK
+    }
+
+    /// A stalled headers phase on a simple GET call site (`whoami`) must
+    /// time out quickly — bounded by `response_headers_timeout`, not left to
+    /// hang for the whole-turn bound — and land in the `AdapterError::Intel`
+    /// bucket, which `crate::acp`'s turn loop treats as retryable (one
+    /// jittered retry when no SSE frame has been received yet; see the
+    /// "transient intel error … retrying once" handling there). Everything
+    /// else in that loop is special-cased out (Cancelled, IntelSessionGone,
+    /// IntelAuth, IntelRateLimited), so asserting the `Intel` variant here
+    /// *is* asserting retryability.
+    #[tokio::test]
+    async fn whoami_headers_timeout_is_retryable() {
+        let app = axum::Router::new().route("/v1/whoami", axum::routing::get(hang_forever));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock gateway");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Kept small so the test stays fast; the production default (570s)
+        // is sized for headroom over the longest legitimate generation
+        // (headers are withheld until generation starts on this gateway),
+        // not for speed.
+        let headers_timeout = Duration::from_millis(150);
+        let client = test_client(format!("http://{addr}"), headers_timeout);
+
+        let started = std::time::Instant::now();
+        let err = client
+            .whoami()
+            .await
+            .expect_err("headers phase must time out");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected the {headers_timeout:?} headers timeout to fire quickly, took {elapsed:?}"
+        );
+
+        match err {
+            AdapterError::Intel(msg) => {
+                let lower = msg.to_lowercase();
+                assert!(
+                    lower.contains("timed out") || lower.contains("timeout"),
+                    "expected a timeout-flavored message, got {msg:?}"
+                );
+            }
+            other => panic!(
+                "expected AdapterError::Intel (the retryable bucket per crate::acp's turn \
+                 loop), got {other:?}"
+            ),
+        }
+    }
+
+    /// Same failure mode as [`whoami_headers_timeout_is_retryable`] but on
+    /// `send_message_stream` — the actual call site involved in the live
+    /// incident (POST `/v1/sessions/{id}/messages`, headers stalled before
+    /// any SSE bytes arrived). Proves the fix isn't limited to the simple
+    /// GET sites: the same `tokio::time::timeout` wrap and retryable
+    /// `AdapterError::Intel` classification applies to the streaming POST.
+    #[tokio::test]
+    async fn send_message_stream_headers_timeout_is_retryable() {
+        let app = axum::Router::new().route(
+            "/v1/sessions/{id}/messages",
+            axum::routing::post(hang_forever),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock gateway");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let headers_timeout = Duration::from_millis(150);
+        let client = test_client(format!("http://{addr}"), headers_timeout);
+        let (_cancel_tx, cancel_rx) = watch::channel(CancelCause::None);
+
+        let started = std::time::Instant::now();
+        let err = client
+            .send_message_stream(
+                "sess-1",
+                "hello",
+                json!({}),
+                &cancel_rx,
+                |_frame: &SseFrame| async {},
+            )
+            .await
+            .expect_err("headers phase must time out before any SSE bytes arrive");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected the {headers_timeout:?} headers timeout to fire quickly, took {elapsed:?}"
+        );
+
+        match err {
+            AdapterError::Intel(msg) => {
+                let lower = msg.to_lowercase();
+                assert!(
+                    lower.contains("timed out") || lower.contains("timeout"),
+                    "expected a timeout-flavored message, got {msg:?}"
+                );
+            }
+            other => panic!(
+                "expected AdapterError::Intel (the retryable bucket per crate::acp's turn \
+                 loop), got {other:?}"
+            ),
+        }
     }
 
     #[test]

@@ -136,6 +136,42 @@ pub struct Cli {
     #[arg(long, env = "INTEL_CONNECT_TIMEOUT_SECS", default_value = "30")]
     pub connect_timeout_secs: u64,
 
+    /// Response headers timeout seconds — bounds only the time to receive
+    /// response **headers** on `.send().await` (connection already
+    /// established, request written). Distinct from `connect_timeout`
+    /// (TCP/TLS handshake) and from the whole-response timeout the client
+    /// deliberately does *not* set (see [`crate::intel::IntelClient::new`]).
+    ///
+    /// Default 570s (matches `sse_idle_timeout`). A 90s bound (the
+    /// previous default, sized off a healthy-turn sample of only *short*
+    /// prompts) caused a real, user-visible failure: a heavy prompt hit
+    /// two consecutive headers timeouts and the turn failed, returning an
+    /// error instead of an answer. Re-sending the identical prompt after
+    /// raising the bound completed in 10s. That does not confirm the
+    /// working theory that headers are withheld until generation is
+    /// underway (so time-to-first-byte scales with output length) — two
+    /// candidate causes for the original slowness remain, and the data on
+    /// hand does not distinguish them: transient gateway degradation (a
+    /// 503 was also observed that day), or headers genuinely gated on
+    /// generation for that one call. 570s is sized to ride out
+    /// slow-to-first-byte periods under either explanation. It reuses the
+    /// per-frame SSE idle bound: both represent the same judgment call
+    /// ("how long is silence from the gateway tolerable before treating
+    /// it as hung"), so headers-wait and stream-idle-wait share one
+    /// threshold instead of two independently-drifting numbers. The
+    /// client retries once on a headers timeout, so worst case this phase
+    /// costs ~2x this value (~1140s) before failing the turn — still well
+    /// under the 3300s whole-turn bound, leaving room for the actual
+    /// streamed response. Do not lower this back toward "typical turn
+    /// latency" (4-8s healthy) — under either explanation, a short bound
+    /// here reproduces the same failure mode.
+    #[arg(
+        long,
+        env = "INTEL_RESPONSE_HEADERS_TIMEOUT_SECS",
+        default_value = "570"
+    )]
+    pub response_headers_timeout_secs: u64,
+
     /// Per-frame SSE idle timeout seconds.
     #[arg(long, env = "INTEL_SSE_IDLE_TIMEOUT_SECS", default_value = "570")]
     pub sse_idle_timeout_secs: u64,
@@ -201,6 +237,10 @@ impl fmt::Debug for Cli {
             .field("entity_mode", &self.entity_mode)
             .field("forward_system_prompt", &self.forward_system_prompt)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field(
+                "response_headers_timeout_secs",
+                &self.response_headers_timeout_secs,
+            )
             .field("sse_idle_timeout_secs", &self.sse_idle_timeout_secs)
             .field("turn_timeout_secs", &self.turn_timeout_secs)
             .field("keepalive_secs", &self.keepalive_secs)
@@ -239,6 +279,9 @@ pub struct Config {
     pub forward_system_prompt: ForwardSystemPrompt,
     /// HTTP connect timeout.
     pub connect_timeout: Duration,
+    /// Timeout bounding only the response-headers phase of a request
+    /// (post-connect, pre-body). See [`Cli::response_headers_timeout_secs`].
+    pub response_headers_timeout: Duration,
     /// SSE idle timeout per frame.
     pub sse_idle_timeout: Duration,
     /// Whole-turn bound.
@@ -279,6 +322,7 @@ impl fmt::Debug for Config {
             .field("entity_mode", &self.entity_mode)
             .field("forward_system_prompt", &self.forward_system_prompt)
             .field("connect_timeout", &self.connect_timeout)
+            .field("response_headers_timeout", &self.response_headers_timeout)
             .field("sse_idle_timeout", &self.sse_idle_timeout)
             .field("turn_timeout", &self.turn_timeout)
             .field("keepalive", &self.keepalive)
@@ -352,6 +396,7 @@ impl Config {
             entity_mode,
             forward_system_prompt,
             connect_timeout: Duration::from_secs(cli.connect_timeout_secs.max(1)),
+            response_headers_timeout: Duration::from_secs(cli.response_headers_timeout_secs.max(1)),
             sse_idle_timeout: Duration::from_secs(cli.sse_idle_timeout_secs.max(1)),
             turn_timeout: Duration::from_secs(cli.turn_timeout_secs.max(1)),
             keepalive: Duration::from_secs(cli.keepalive_secs.max(1)),
@@ -373,6 +418,40 @@ impl Config {
                 .map(str::to_owned),
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
         })
+    }
+
+    /// One-line, non-secret summary of the resolved config for startup logs.
+    ///
+    /// Deliberately names every field instead of deriving/using `{:?}` on
+    /// `self` — `Config` holds [`Config::api_key`], and a struct-wide `Debug`
+    /// dump would print it via the manual [`fmt::Debug`] impl above only if
+    /// that impl is ever bypassed; this method exists so no caller needs to
+    /// reach for `{:?}` in the first place. Never add `self.api_key` (or
+    /// anything derived from it) to this string; the API key must never
+    /// appear in logs. See `specs/intel-agent-integration` for the operator
+    /// rationale (spend ceiling must be checkable without opening the
+    /// secrets file that holds the live gateway key).
+    pub fn summary(&self) -> String {
+        let max_turns_per_window = self
+            .quota
+            .max_turns_per_window
+            .map_or_else(|| "disabled".to_owned(), |n| n.to_string());
+        format!(
+            "gateway_url={} agent={} entity_mode={:?} forward_system_prompt={:?} error_replies={} \
+             connect_timeout={}s response_headers_timeout={}s sse_idle_timeout={}s turn_timeout={}s \
+             max_turns_per_window={} quota_window_secs={}",
+            self.gateway_url,
+            self.agent,
+            self.entity_mode,
+            self.forward_system_prompt,
+            self.error_replies,
+            self.connect_timeout.as_secs(),
+            self.response_headers_timeout.as_secs(),
+            self.sse_idle_timeout.as_secs(),
+            self.turn_timeout.as_secs(),
+            max_turns_per_window,
+            self.quota.window.as_secs(),
+        )
     }
 
     /// Fail if the gateway URL or API key required by one-shot gateway calls is missing.
@@ -554,6 +633,73 @@ mod tests {
         assert!(config_debug.contains("private_key: Some(\"<redacted>\")"));
         assert!(config_debug.contains("https://debug-gateway.example.test"));
         assert!(config_debug.contains("debug-agent"));
+    }
+
+    /// Dummy key is recognisable ("SECRETVALUE") so a leak is unmistakable
+    /// in a failing assertion, not just a plausible-looking string.
+    const SUMMARY_TEST_API_KEY: &str = "intel_SECRETVALUE";
+
+    fn summary_test_config() -> Config {
+        let cli = Cli::try_parse_from([
+            "buzz-intel-agent",
+            "--gateway-url",
+            "https://intel.example.test",
+            "--api-key",
+            SUMMARY_TEST_API_KEY,
+            "--agent",
+            "brain-prod",
+            "--response-headers-timeout-secs",
+            "570",
+            "--sse-idle-timeout-secs",
+            "570",
+            "--turn-timeout-secs",
+            "3300",
+            "--max-turns-per-window",
+            "7",
+            "--quota-window-secs",
+            "120",
+        ])
+        .expect("summary test CLI should parse");
+        Config::from_cli(&cli).expect("summary test config should resolve")
+    }
+
+    #[test]
+    fn summary_contains_quota_and_timeout_values() {
+        let summary = summary_test_config().summary();
+        assert!(
+            summary.contains("max_turns_per_window=7"),
+            "summary missing max_turns_per_window: {summary}"
+        );
+        assert!(
+            summary.contains("quota_window_secs=120"),
+            "summary missing quota_window_secs: {summary}"
+        );
+        assert!(summary.contains("response_headers_timeout=570s"));
+        assert!(summary.contains("sse_idle_timeout=570s"));
+        assert!(summary.contains("turn_timeout=3300s"));
+        assert!(summary.contains("gateway_url=https://intel.example.test"));
+        assert!(summary.contains("agent=brain-prod"));
+    }
+
+    #[test]
+    fn summary_never_contains_the_api_key() {
+        let summary = summary_test_config().summary();
+        assert!(
+            !summary.contains(SUMMARY_TEST_API_KEY),
+            "summary leaked the API key: {summary}"
+        );
+        assert!(
+            !summary.contains("SECRETVALUE"),
+            "summary leaked API key material: {summary}"
+        );
+    }
+
+    #[test]
+    fn summary_disabled_quota_is_readable() {
+        let mut cfg = summary_test_config();
+        cfg.quota = crate::quota::QuotaConfig::new(0, 3600);
+        let summary = cfg.summary();
+        assert!(summary.contains("max_turns_per_window=disabled"));
     }
 
     #[test]

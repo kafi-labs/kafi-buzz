@@ -213,4 +213,238 @@ mod tests {
         assert_eq!(floor_char_boundary(s, 6), 6);
         assert_eq!(floor_char_boundary(s, 100), s.len());
     }
+
+    /// Content-preservation coverage for the paragraph (`\n\n`) split path.
+    ///
+    /// `large_splits_on_paragraphs` above only checks chunk count/size, so a bug that
+    /// silently dropped or reordered a whole paragraph would still pass it. Here every
+    /// paragraph is tagged with a distinct, zero-padded index so a dropped, duplicated,
+    /// or reordered paragraph is directly detectable. Comparison is whitespace-normalised
+    /// (each paragraph is `.trim()`-ed before comparison) because `chunk_content` is
+    /// documented to trim seam whitespace — that is expected, not a defect.
+    #[test]
+    fn paragraph_path_preserves_all_markers_in_order() {
+        let filler = "x".repeat(50);
+        let para_count = 3072usize;
+        let mut text = String::new();
+        for i in 0..para_count {
+            if i > 0 {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!("PARA{i:04}-{filler}"));
+        }
+        assert!(
+            text.len() > CHUNK_SOFT_LIMIT * 2,
+            "test text must be comfortably oversized to force multiple chunks"
+        );
+
+        let chunks = chunk_content(&text);
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert!(
+                c.len() <= CHUNK_SOFT_LIMIT,
+                "chunk of {} bytes exceeds soft limit",
+                c.len()
+            );
+        }
+
+        // Internal "\n\n" separators inside a chunk survive untouched — only the seam at
+        // each chunk boundary is trimmed — so splitting each chunk on "\n\n" and trimming
+        // recovers the original paragraphs losslessly.
+        let mut found = Vec::with_capacity(para_count);
+        for chunk in &chunks {
+            for part in chunk.split("\n\n") {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let (marker, body) = part
+                    .split_once('-')
+                    .unwrap_or_else(|| panic!("malformed paragraph fragment: {part:?}"));
+                let idx: usize = marker
+                    .strip_prefix("PARA")
+                    .unwrap_or_else(|| panic!("missing PARA prefix in {marker:?}"))
+                    .parse()
+                    .unwrap_or_else(|_| panic!("non-numeric paragraph index in {marker:?}"));
+                assert_eq!(body, filler, "paragraph {idx} body corrupted");
+                found.push(idx);
+            }
+        }
+
+        assert_eq!(
+            found.len(),
+            para_count,
+            "expected {para_count} paragraph markers, found {} (dropped or merged paragraphs)",
+            found.len()
+        );
+        assert_eq!(
+            found,
+            (0..para_count).collect::<Vec<_>>(),
+            "paragraph markers out of order or duplicated"
+        );
+    }
+
+    /// Same content-preservation guarantee as the paragraph-path test above, but for the
+    /// single-newline fallback: text with `\n`-separated lines and deliberately no `\n\n`
+    /// anywhere, so `chunk_content` must fall through to the `rfind('\n')` branch.
+    #[test]
+    fn single_newline_path_preserves_all_markers_in_order() {
+        let filler = "y".repeat(50);
+        let line_count = 3072usize;
+        let mut text = String::new();
+        for i in 0..line_count {
+            if i > 0 {
+                text.push('\n');
+            }
+            text.push_str(&format!("LINE{i:04}-{filler}"));
+        }
+        // Sanity: this construction must not accidentally contain a paragraph break,
+        // otherwise we'd be exercising the "\n\n" path instead of the "\n" path.
+        assert!(!text.contains("\n\n"));
+        assert!(
+            text.len() > CHUNK_SOFT_LIMIT * 2,
+            "test text must be comfortably oversized to force multiple chunks"
+        );
+
+        let chunks = chunk_content(&text);
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert!(c.len() <= CHUNK_SOFT_LIMIT);
+            assert!(
+                !c.contains("\n\n"),
+                "chunk unexpectedly contains a paragraph break"
+            );
+        }
+
+        let mut found = Vec::with_capacity(line_count);
+        for chunk in &chunks {
+            for part in chunk.split('\n') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let (marker, body) = part
+                    .split_once('-')
+                    .unwrap_or_else(|| panic!("malformed line fragment: {part:?}"));
+                let idx: usize = marker
+                    .strip_prefix("LINE")
+                    .unwrap_or_else(|| panic!("missing LINE prefix in {marker:?}"))
+                    .parse()
+                    .unwrap_or_else(|_| panic!("non-numeric line index in {marker:?}"));
+                assert_eq!(body, filler, "line {idx} body corrupted");
+                found.push(idx);
+            }
+        }
+
+        assert_eq!(
+            found.len(),
+            line_count,
+            "expected {line_count} line markers, found {} (dropped or merged lines)",
+            found.len()
+        );
+        assert_eq!(
+            found,
+            (0..line_count).collect::<Vec<_>>(),
+            "line markers out of order or duplicated"
+        );
+    }
+
+    /// Content-preservation guarantee for the space-fallback path: text with spaces but
+    /// no newlines at all, forcing `chunk_content` down to `rfind(' ')`. Asserts that no
+    /// non-whitespace character is lost, duplicated, or reordered.
+    #[test]
+    fn space_fallback_path_preserves_all_tokens_in_order() {
+        let token_count = 20_000usize;
+        let mut expected_tokens = Vec::with_capacity(token_count);
+        let mut text = String::new();
+        for i in 0..token_count {
+            if i > 0 {
+                text.push(' ');
+            }
+            let tok = format!("TOK{i:05}");
+            text.push_str(&tok);
+            expected_tokens.push(tok);
+        }
+        assert!(!text.contains('\n'));
+        assert!(
+            text.len() > CHUNK_SOFT_LIMIT * 2,
+            "test text must be comfortably oversized to force multiple chunks"
+        );
+
+        let chunks = chunk_content(&text);
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert!(c.len() <= CHUNK_SOFT_LIMIT);
+            assert!(!c.contains('\n'));
+        }
+
+        let found: Vec<&str> = chunks.iter().flat_map(|c| c.split_whitespace()).collect();
+        assert_eq!(
+            found.len(),
+            expected_tokens.len(),
+            "token count mismatch: some tokens were dropped or merged"
+        );
+        assert_eq!(found, expected_tokens, "tokens reordered or corrupted");
+
+        // No non-whitespace character lost: concatenating tokens in found order
+        // reproduces the original non-whitespace content exactly.
+        let expected_chars: String = expected_tokens.concat();
+        let found_chars: String = found.concat();
+        assert_eq!(found_chars, expected_chars);
+    }
+
+    /// Characterizes the *intended* trimming behavior at a chunk seam: `chunk_content` is
+    /// documented to eat the whitespace immediately surrounding a split point (so chunks
+    /// don't start/end with stray blank lines), but it must NEVER eat non-whitespace
+    /// characters adjacent to that seam. This pins the exact boundary so a future change
+    /// that starts trimming real characters (instead of only whitespace) fails loudly,
+    /// rather than being masked by the coarser ">CHUNK_SOFT_LIMIT" checks elsewhere.
+    #[test]
+    fn seam_trims_only_whitespace_never_real_characters_characterization() {
+        let head_marker = "HEADEND";
+        let tail_marker = "TAILSTART";
+        // Deliberately messy seam: two "\n\n" paragraph breaks with a stray space between
+        // them, plus trailing spaces before the next real content starts. rfind("\n\n")
+        // lands on the *second* "\n\n", so trim_end() must eat "\n\n \n\n" off the head
+        // side and trim_start() must eat the trailing "   " off the tail side — proving
+        // the trim consumes the *entire* whitespace run, not just one adjacent char.
+        let seam = "\n\n \n\n   ";
+        let tail_filler = "t".repeat(2_000);
+        let filler_len = CHUNK_SOFT_LIMIT - head_marker.len() - seam.len() - 50;
+        let filler = "h".repeat(filler_len);
+
+        let text = format!("{filler}{head_marker}{seam}{tail_marker}{tail_filler}");
+        assert!(text.len() > CHUNK_SOFT_LIMIT);
+
+        let chunks = chunk_content(&text);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected exactly one split for this construction"
+        );
+
+        // Non-whitespace content on both sides of the seam survives byte-for-byte...
+        assert!(chunks[0].ends_with(head_marker));
+        assert!(chunks[1].starts_with(tail_marker));
+        // ...and no whitespace at all remains at either seam edge...
+        assert!(!chunks[0].ends_with(|c: char| c.is_whitespace()));
+        assert!(!chunks[1].starts_with(|c: char| c.is_whitespace()));
+        // ...meaning the seam whitespace was removed in its entirety, not just one
+        // character of it, and nothing else was touched: concatenating the chunks
+        // reproduces the original text with exactly the seam whitespace deleted.
+        let expected = format!("{filler}{head_marker}{tail_marker}{tail_filler}");
+        assert_eq!(chunks.concat(), expected);
+    }
 }

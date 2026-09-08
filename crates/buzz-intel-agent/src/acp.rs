@@ -11,10 +11,11 @@ use rand::RngExt;
 use serde_json::{json, Value};
 use tokio::io::BufReader;
 use tokio::sync::{mpsc, watch, Mutex};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::config::{Config, EntityMode, ForwardSystemPrompt, SessionMode, PROTOCOL_VERSION};
-use crate::error::AdapterError;
+use crate::error::{AdapterError, CancelCause};
 use crate::intel::{FrameKind, IntelClient, SseFrame};
 use crate::prompt::parse_prompt;
 use crate::quota::TurnQuota;
@@ -33,10 +34,33 @@ const SESSION_UPDATE_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 /// Bound for the outbound wire channel (session/update + responses).
 const WIRE_CHANNEL_CAP: usize = 256;
 
+/// Max time `graceful_shutdown` waits for in-flight `session/prompt` tasks
+/// to react to a shutdown-caused cancellation (e.g. post an
+/// interrupted-turn notice) before giving up and letting the process exit.
+///
+/// Bounded well under the observed production SIGTERM→kill window (~4.4s
+/// for the managing harness to force-kill this process) so we never race
+/// that external deadline, and applied as a single absolute wait regardless
+/// of how many turns are in flight — a hung shutdown is worse than a missed
+/// notification.
+const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Max time a single shutdown-interrupted-turn notice post may take. Nested
+/// inside `SHUTDOWN_GRACE_TIMEOUT` — a slow or dead relay must not hang
+/// shutdown.
+const SHUTDOWN_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Owner-visible notice posted when a turn is dropped mid-flight by a
+/// service restart (shutdown-caused cancellation). Matches the register of
+/// `intel_rate_limited_message` / `quota_exceeded_message`: short, states
+/// what happened, tells the asker what to do.
+const SHUTDOWN_INTERRUPTED_MESSAGE: &str =
+    "⚠️ This turn was interrupted by a service restart. Please ask again.";
+
 /// Local ACP session state.
 struct AcpSession {
     system_prompt: Option<String>,
-    cancel_tx: watch::Sender<bool>,
+    cancel_tx: watch::Sender<CancelCause>,
     busy: bool,
     /// Turn epoch — incremented on cancel so late replies are suppressed.
     epoch: u64,
@@ -54,6 +78,13 @@ struct App {
     relay: Option<RelayPublisher>,
     /// Per-scope LLM turn quota, checked before any paid gateway call.
     quota: Mutex<TurnQuota>,
+    /// In-flight `session/prompt` tasks, tracked so `graceful_shutdown` can
+    /// wait (bounded by `SHUTDOWN_GRACE_TIMEOUT`) for them to react to a
+    /// shutdown-caused cancellation before the process exits. Without this,
+    /// spawned tasks are simply dropped mid-flight when the tokio runtime
+    /// tears down, and a shutdown-interrupted notice would never get a
+    /// chance to send.
+    prompt_tasks: Mutex<JoinSet<()>>,
 }
 
 /// Run the ACP NDJSON server until stdin EOF or SIGTERM.
@@ -87,6 +118,7 @@ pub async fn run_server(cfg: Config) -> Result<(), AdapterError> {
         create_locks: Mutex::new(HashMap::new()),
         relay,
         quota: Mutex::new(TurnQuota::new(cfg.quota)),
+        prompt_tasks: Mutex::new(JoinSet::new()),
     });
 
     let (wire_tx, wire_rx) = mpsc::channel::<WireMsg>(WIRE_CHANNEL_CAP);
@@ -140,9 +172,35 @@ async fn graceful_shutdown(app: &App) {
     {
         let sessions = app.sessions.lock().await;
         for s in sessions.values() {
-            let _ = s.cancel_tx.send(true);
+            let _ = s.cancel_tx.send(CancelCause::Shutdown);
         }
     }
+
+    // Give in-flight `session/prompt` tasks a bounded window to react to the
+    // shutdown signal (see `run_turn`'s shutdown-interrupted notice) before
+    // this function returns and the process exits. `join_next` polls all
+    // remaining tasks concurrently, so this is one shared deadline across
+    // however many turns happen to be in flight, not a per-task budget.
+    {
+        let mut tasks = app.prompt_tasks.lock().await;
+        if !tasks.is_empty() {
+            let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE_TIMEOUT;
+            while tokio::time::timeout_at(deadline, tasks.join_next())
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {}
+            if !tasks.is_empty() {
+                tracing::warn!(
+                    remaining = tasks.len(),
+                    "graceful_shutdown: in-flight session/prompt task(s) did not finish within {}ms; proceeding",
+                    SHUTDOWN_GRACE_TIMEOUT.as_millis()
+                );
+            }
+        }
+    }
+
     if let Err(e) = app.state.lock().await.flush() {
         tracing::warn!("state flush on shutdown: {e}");
     }
@@ -200,9 +258,19 @@ async fn handle_request(
         "initialize" => initialize(app, id, params, wire_tx).await,
         "session/new" => session_new(app, id, params, wire_tx).await,
         "session/prompt" => {
-            let app = app.clone();
+            let app_task = app.clone();
             let wire_tx = wire_tx.clone();
-            tokio::spawn(async move {
+            // Tracked in `app.prompt_tasks` (not a bare `tokio::spawn`) so
+            // `graceful_shutdown` can wait, bounded, for this task to react
+            // to a shutdown-caused cancellation before the process exits.
+            let mut tasks = app.prompt_tasks.lock().await;
+            // `JoinSet` keeps completed-but-unjoined handles until drained —
+            // opportunistically prune them here so this set stays bounded by
+            // turns *currently* in flight, not every turn this long-lived
+            // process has ever handled.
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn(async move {
+                let app = app_task;
                 // Contain panics so session.busy is cleared and the client
                 // receives a JSON-RPC error instead of hanging forever.
                 let session_id_hint = params
@@ -220,7 +288,11 @@ async fn handle_request(
                         let mut sessions = app.sessions.lock().await;
                         if let Some(s) = sessions.get_mut(sid) {
                             s.busy = false;
-                            let _ = s.cancel_tx.send(true);
+                            // Not a shutdown cause — this is an internal
+                            // failure already reported below via a direct
+                            // JSON-RPC error, so it must stay silent on the
+                            // buzz-channel-reply path (same as a user cancel).
+                            let _ = s.cancel_tx.send(CancelCause::User);
                         }
                     }
                     wire::send(
@@ -360,7 +432,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
     let _ = p.mcp_servers;
 
     let session_id = format!("ses_{}", Uuid::new_v4());
-    let (cancel_tx, _) = watch::channel(false);
+    let (cancel_tx, _) = watch::channel(CancelCause::None);
     let session = AcpSession {
         system_prompt: p.system_prompt.filter(|s| !s.trim().is_empty()),
         cancel_tx,
@@ -386,7 +458,7 @@ async fn cancel_session(app: &Arc<App>, params: Value) {
     let mut sessions = app.sessions.lock().await;
     if let Some(s) = sessions.get_mut(&p.session_id) {
         s.epoch = s.epoch.saturating_add(1);
-        let _ = s.cancel_tx.send(true);
+        let _ = s.cancel_tx.send(CancelCause::User);
         tracing::info!(
             session_id = %p.session_id,
             epoch = s.epoch,
@@ -431,7 +503,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             .await;
         }
         // Reset cancel flag for this turn.
-        let _ = s.cancel_tx.send(false);
+        let _ = s.cancel_tx.send(CancelCause::None);
         s.busy = true;
         let rx = s.cancel_tx.subscribe();
         (rx, s.epoch, s.system_prompt.clone())
@@ -518,10 +590,11 @@ async fn run_turn(
     parsed: &crate::prompt::ParsedPrompt,
     system_prompt: Option<&str>,
     epoch: u64,
-    cancel_rx: &mut watch::Receiver<bool>,
+    cancel_rx: &mut watch::Receiver<CancelCause>,
     wire_tx: &WireSender,
 ) -> Result<String, AdapterError> {
-    if *cancel_rx.borrow() {
+    if *cancel_rx.borrow() != CancelCause::None {
+        notify_if_shutdown_cancelled(app, cancel_rx, parsed, epoch, acp_session_id).await;
         return Err(AdapterError::Cancelled);
     }
 
@@ -584,7 +657,36 @@ async fn run_turn(
                 }
                 return Err(AdapterError::IntelAuth(msg));
             }
-            Err(AdapterError::Cancelled) => return Err(AdapterError::Cancelled),
+            Err(AdapterError::IntelRateLimited {
+                retry_after_secs,
+                message,
+            }) => {
+                tracing::warn!(
+                    retry_after_secs = ?retry_after_secs,
+                    error = %message,
+                    "intel gateway rate limited us"
+                );
+                if app.cfg.error_replies {
+                    let text = crate::intel::intel_rate_limited_message(retry_after_secs);
+                    let _ = post_error_reply(
+                        app,
+                        parsed.channel_id,
+                        parsed.reply_to_event_id.as_deref(),
+                        &text,
+                        epoch,
+                        acp_session_id,
+                    )
+                    .await;
+                }
+                return Err(AdapterError::IntelRateLimited {
+                    retry_after_secs,
+                    message,
+                });
+            }
+            Err(AdapterError::Cancelled) => {
+                notify_if_shutdown_cancelled(app, cancel_rx, parsed, epoch, acp_session_id).await;
+                return Err(AdapterError::Cancelled);
+            }
             Err(e) => {
                 // Transient: one jittered retry only if no SSE frame was received
                 // is handled inside ensure_and_run; here we post error reply.
@@ -618,7 +720,7 @@ async fn ensure_and_run(
     system_prompt: Option<&str>,
     parsed: &crate::prompt::ParsedPrompt,
     epoch: u64,
-    cancel_rx: &mut watch::Receiver<bool>,
+    cancel_rx: &mut watch::Receiver<CancelCause>,
     wire_tx: &WireSender,
     force_new: bool,
 ) -> Result<String, AdapterError> {
@@ -631,6 +733,28 @@ async fn ensure_and_run(
         || app.intel.create_session(agent_id, entity_id),
     )
     .await?;
+
+    // Fires exactly once per created session (gated on `is_new`, not per
+    // turn) — this is the only place either the intel gateway's own
+    // `session_id` or the `entity_id` sent in its `metadata` were ever
+    // observable at runtime. Neither previously appeared in any log line:
+    // the `ses_…` ids elsewhere in the journal come from `buzz-acp`'s own
+    // session pool, a different id space, so correlating the two after the
+    // fact required matching on `agent_id` + exact creation timestamp
+    // across every session. See `intel_session_created_summary` for the
+    // secret-safety rationale.
+    if is_new {
+        let channel_id = parsed.channel_id.map(|u| u.to_string());
+        tracing::info!(
+            "intel session created: {}",
+            intel_session_created_summary(
+                &intel_session_id,
+                entity_id,
+                channel_id.as_deref(),
+                &app.cfg.agent,
+            )
+        );
+    }
 
     let message = build_outbound_message(
         app.cfg.forward_system_prompt,
@@ -710,13 +834,26 @@ async fn ensure_and_run(
             Err(AdapterError::Cancelled) => break Err(AdapterError::Cancelled),
             Err(AdapterError::IntelSessionGone(e)) => break Err(AdapterError::IntelSessionGone(e)),
             Err(AdapterError::IntelAuth(e)) => break Err(AdapterError::IntelAuth(e)),
+            Err(AdapterError::IntelRateLimited {
+                retry_after_secs,
+                message,
+            }) => {
+                // Gateway backpressure: surface immediately rather than
+                // retrying. The gateway already told us how long to wait
+                // (Retry-After); a jittered ~1s retry would ignore that
+                // signal and add load to an already-overloaded upstream.
+                break Err(AdapterError::IntelRateLimited {
+                    retry_after_secs,
+                    message,
+                });
+            }
             Err(e) if first_try && !received_any_frame => {
                 // One jittered retry only if no SSE frame was received.
                 first_try = false;
                 let delay = jitter_backoff();
                 tracing::warn!("transient intel error ({e}); retrying once after {delay:?}");
                 tokio::time::sleep(delay).await;
-                if *cancel_rx.borrow() {
+                if *cancel_rx.borrow() != CancelCause::None {
                     break Err(AdapterError::Cancelled);
                 }
                 continue;
@@ -860,6 +997,28 @@ async fn ensure_and_run(
     Ok("end_turn".into())
 }
 
+/// One-line, non-secret `key=value` summary emitted when a **new** intel
+/// session is created (see the call site in [`ensure_and_run`]). Mirrors
+/// the shape of the startup line built by
+/// [`crate::config::Config::summary`].
+///
+/// Deliberately takes only the fields that are safe to log, by name,
+/// rather than a struct that might also hold `api_key` (`Config` does,
+/// right next to `agent`) — there is no field here a caller could pass
+/// that would leak the API key or any auth header. Never widen this
+/// signature to accept `Config`/`App` wholesale for that reason.
+fn intel_session_created_summary(
+    intel_session_id: &str,
+    entity_id: &str,
+    channel_id: Option<&str>,
+    agent: &str,
+) -> String {
+    format!(
+        "session_id={intel_session_id} entity_id={entity_id} channel_id={} agent={agent}",
+        channel_id.unwrap_or("none"),
+    )
+}
+
 async fn emit_acp_frame(wire_tx: &WireSender, sid: &str, frame: &SseFrame) {
     let update = match frame.kind {
         FrameKind::Thinking => {
@@ -952,6 +1111,9 @@ fn classify_owner_error(e: &AdapterError) -> (String, Option<String>) {
         }
         AdapterError::IntelAuth(_) => "credentials rejected",
         AdapterError::IntelSessionGone(_) => "session expired",
+        // Callers handle this variant explicitly with `intel_rate_limited_message`
+        // before it would reach here; this arm is a defensive fallback only.
+        AdapterError::IntelRateLimited { .. } => "rate limited",
         _ => "turn failed",
     };
     (category.to_owned(), rid)
@@ -1203,6 +1365,50 @@ async fn notify_incomplete_answer(
     let _ = post_error_reply(app, channel_id, reply_to, text, epoch, acp_session_id).await;
 }
 
+/// On a shutdown-caused cancellation, best-effort notify the channel that
+/// the turn was interrupted so the asker knows to retry. User-initiated
+/// cancels (`session/cancel`) and Steer supersedes carry
+/// [`CancelCause::User`] and are intentionally left silent — the asker
+/// withdrew the question, or a merged turn will answer instead. Only
+/// [`CancelCause::Shutdown`] posts. No-ops when `app.cfg.error_replies` is
+/// unset, matching every other owner-visible-error call site.
+///
+/// Bounded by [`SHUTDOWN_REPLY_TIMEOUT`] so a slow or dead relay during the
+/// shutdown grace window cannot hang shutdown — a hung shutdown is worse
+/// than a missing notification, so a timed-out or failed post is logged and
+/// swallowed here, never propagated to the caller.
+async fn notify_if_shutdown_cancelled(
+    app: &App,
+    cancel_rx: &watch::Receiver<CancelCause>,
+    parsed: &crate::prompt::ParsedPrompt,
+    epoch: u64,
+    acp_session_id: &str,
+) {
+    if !app.cfg.error_replies || *cancel_rx.borrow() != CancelCause::Shutdown {
+        return;
+    }
+    match tokio::time::timeout(
+        SHUTDOWN_REPLY_TIMEOUT,
+        post_error_reply(
+            app,
+            parsed.channel_id,
+            parsed.reply_to_event_id.as_deref(),
+            SHUTDOWN_INTERRUPTED_MESSAGE,
+            epoch,
+            acp_session_id,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("shutdown-interrupted notice failed to post: {e}"),
+        Err(_) => tracing::warn!(
+            "shutdown-interrupted notice skipped: exceeded {}ms bound",
+            SHUTDOWN_REPLY_TIMEOUT.as_millis()
+        ),
+    }
+}
+
 fn jitter_backoff() -> Duration {
     let base_ms = 500u64;
     let jitter = rand::rng().random_range(0..1000u64);
@@ -1292,5 +1498,68 @@ mod tests {
         assert!(!id.contains(':'));
         assert!(!id.contains('-'));
         assert_alphanumeric_entity_id(&id);
+    }
+
+    /// Recognisable dummy so a prefix-only leak ("intel_SECRE...") would
+    /// still trip the substring check below — mirrors
+    /// `config::tests::SUMMARY_TEST_API_KEY`.
+    const TEST_API_KEY: &str = "intel_SECRETVALUE";
+
+    #[test]
+    fn intel_session_created_summary_reports_ids_and_agent() {
+        let line = intel_session_created_summary(
+            "sess-abc123",
+            "buzzchannelaaaa1111",
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+            "brain-prod",
+        );
+        assert!(line.contains("session_id=sess-abc123"), "{line}");
+        assert!(line.contains("entity_id=buzzchannelaaaa1111"), "{line}");
+        assert!(
+            line.contains("channel_id=550e8400-e29b-41d4-a716-446655440000"),
+            "{line}"
+        );
+        assert!(line.contains("agent=brain-prod"), "{line}");
+    }
+
+    #[test]
+    fn intel_session_created_summary_missing_channel_is_explicit() {
+        let line = intel_session_created_summary("sess-1", "buzzagentbeef", None, "brain-prod");
+        assert!(line.contains("channel_id=none"), "{line}");
+    }
+
+    /// Load-bearing negative assertion: `ensure_and_run`'s call site reads
+    /// `agent` from `app.cfg`, which also holds `api_key` right next to it
+    /// (see `Config::summary`'s own equivalent test). Build a fixture that
+    /// carries both, call the render function with only the fields it is
+    /// meant to take, and prove the API key — full value or bare
+    /// "SECRETVALUE" substring (a truncated/prefix leak) — never appears in
+    /// the rendered line.
+    #[test]
+    fn intel_session_created_summary_never_contains_the_api_key() {
+        struct FakeCfg {
+            agent: String,
+            api_key: String,
+        }
+        let cfg = FakeCfg {
+            agent: "brain-prod".to_owned(),
+            api_key: TEST_API_KEY.to_owned(),
+        };
+
+        let line = intel_session_created_summary(
+            "sess-abc123",
+            "buzzchannelaaaa1111",
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+            &cfg.agent,
+        );
+
+        assert!(
+            !line.contains(&cfg.api_key),
+            "log line leaked the API key: {line}"
+        );
+        assert!(
+            !line.contains("SECRETVALUE"),
+            "log line leaked API key material: {line}"
+        );
     }
 }
