@@ -467,6 +467,43 @@ async fn cancel_session(app: &Arc<App>, params: Value) {
     }
 }
 
+/// Reset a session's cancel signal at the start of a new turn — without
+/// clobbering a `Shutdown` signal that may have already landed on the
+/// channel.
+///
+/// `handle_request` registers a `session/prompt` task in `app.prompt_tasks`
+/// (via `JoinSet::spawn`) before that task is ever polled — `tokio::spawn`
+/// always leaves a scheduling gap between registration and first poll. If
+/// `graceful_shutdown` sends `CancelCause::Shutdown` into that exact gap,
+/// this reset runs next as the very first thing the (now-polled) task does.
+/// `watch` is a last-write-wins channel with no compare-and-swap of its
+/// own, so an unconditional `send(CancelCause::None)` here would silently
+/// erase the shutdown signal: the turn would proceed as if nothing
+/// happened, still get dropped when `graceful_shutdown`'s grace timeout
+/// expires, but the shutdown-interrupted notice this whole mechanism exists
+/// to deliver would never fire. `send_if_modified` locks internally around
+/// the read-modify-write, so this check-then-set is atomic with respect to
+/// a concurrent `graceful_shutdown` send on the same sender — whichever
+/// send actually happens first is the one that determines the outcome, and
+/// a `Shutdown` that got there first always survives.
+///
+/// Any other prior value (`None`, or a `User` cancel) is intentionally
+/// still cleared here — see the doc comment on
+/// `reset_cancel_for_new_turn_intentionally_still_clobbers_user` for why
+/// `User` deliberately does **not** get the same protection as `Shutdown`,
+/// even though `cancel_session` and this reset race through the exact same
+/// `app.sessions` mutex-ordering shape.
+fn reset_cancel_for_new_turn(cancel_tx: &watch::Sender<CancelCause>) {
+    cancel_tx.send_if_modified(|c| {
+        if *c == CancelCause::Shutdown {
+            false
+        } else {
+            *c = CancelCause::None;
+            true
+        }
+    });
+}
+
 async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
     let p: SessionPromptParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -502,8 +539,9 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             )
             .await;
         }
-        // Reset cancel flag for this turn.
-        let _ = s.cancel_tx.send(CancelCause::None);
+        // Reset cancel flag for this turn — see `reset_cancel_for_new_turn`
+        // for why this must not be a plain `send(None)`.
+        reset_cancel_for_new_turn(&s.cancel_tx);
         s.busy = true;
         let rx = s.cancel_tx.subscribe();
         (rx, s.epoch, s.system_prompt.clone())
@@ -1422,6 +1460,92 @@ async fn reject(wire_tx: &WireSender, id: Value, code: i32, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the shutdown-notice silent-loss race: binds directly
+    /// to `reset_cancel_for_new_turn`, the exact function `session_prompt`
+    /// calls to reset a session's cancel signal at the start of a turn.
+    ///
+    /// This reproduces the ordering from the defect deterministically,
+    /// without sleeps or real tokio-scheduling races: `graceful_shutdown`'s
+    /// send is issued first (as it would be if it landed in the gap
+    /// between a spawned task's registration in `app.prompt_tasks` and its
+    /// first poll), then the turn's own reset runs. A marker/string check on
+    /// the shutdown-notice text would pass on both the broken and fixed
+    /// code — the notice text is already present and already referenced,
+    /// and it still silently fails to be seen because the cancel cause is
+    /// gone by the time `run_turn` checks it. Only the actual value left in
+    /// the channel after this exact ordering distinguishes broken from
+    /// fixed, so that is what this test asserts on.
+    ///
+    /// Proven falsifiable: with `reset_cancel_for_new_turn`'s body swapped
+    /// back to the pre-fix `*c = CancelCause::None;` unconditional write
+    /// (no guard), this test fails — `left: None, right: Shutdown` — before
+    /// being restored to the guarded version, where it passes. See the
+    /// commit message for the full RED-then-GREEN transcript.
+    #[test]
+    fn reset_cancel_for_new_turn_does_not_clobber_shutdown() {
+        let (tx, rx) = watch::channel(CancelCause::None);
+        tx.send(CancelCause::Shutdown).unwrap();
+
+        reset_cancel_for_new_turn(&tx);
+
+        assert_eq!(
+            *rx.borrow(),
+            CancelCause::Shutdown,
+            "a new turn's reset must not clobber a shutdown signal that arrived first"
+        );
+    }
+
+    /// Deliberate asymmetry — pinned here so a future reader sees it as a
+    /// decision, not an oversight the way the `Shutdown` case originally
+    /// was. `cancel_session` (the `User` writer) and `graceful_shutdown`
+    /// (the `Shutdown` writer) both race `reset_cancel_for_new_turn`
+    /// through the exact same `app.sessions` mutex-ordering shape — a
+    /// `session/cancel` that lands in the gap between a spawned
+    /// `session/prompt` task's registration and its first poll can clobber
+    /// a `User` cause exactly the way `Shutdown` could. This test proves
+    /// that race is *not* closed for `User`, on purpose:
+    ///
+    /// Unlike `Shutdown` (after which no further turn is ever dispatched —
+    /// the read loop has already stopped), a session keeps taking new
+    /// turns after a `User` cancel, every one of which must be able to
+    /// reset a leftover `User` cause back to `None` to start clean.
+    /// Guarding *any* non-`None` value here (not just `Shutdown`) would
+    /// close this specific race but reopen a worse one: a stray or
+    /// already-consumed `User` cause with no in-flight turn left to clear
+    /// it (a duplicate cancel, or one that lands just after a turn's own
+    /// natural completion) would permanently wedge the session — every
+    /// later, entirely unrelated turn would see a non-`None` cause at
+    /// setup and treat itself as pre-cancelled forever.
+    ///
+    /// Closing the `User` race correctly needs something this fix doesn't
+    /// have: a way to tell "this cause targets the request about to run"
+    /// apart from "this cause is stale," e.g. an epoch captured at dispatch
+    /// time (in `handle_request`, before `spawn`) rather than inside the
+    /// turn's own setup. That is a larger structural change than this
+    /// fix's scope (closing the shutdown-notice loss) warrants, so it is
+    /// left as a known, documented gap rather than solved here.
+    #[test]
+    fn reset_cancel_for_new_turn_intentionally_still_clobbers_user() {
+        let (tx, rx) = watch::channel(CancelCause::User);
+
+        reset_cancel_for_new_turn(&tx);
+
+        assert_eq!(
+            *rx.borrow(),
+            CancelCause::None,
+            "User is deliberately still clobberable by this reset — see the doc comment above"
+        );
+    }
+
+    /// Plain `None` start stays `None` after a reset (the common case: no
+    /// concurrent writer at all).
+    #[test]
+    fn reset_cancel_for_new_turn_is_a_no_op_from_none() {
+        let (tx, rx) = watch::channel(CancelCause::None);
+        reset_cancel_for_new_turn(&tx);
+        assert_eq!(*rx.borrow(), CancelCause::None);
+    }
 
     #[test]
     fn owner_visible_error_omits_gateway_internals() {
